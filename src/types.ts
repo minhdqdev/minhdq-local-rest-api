@@ -200,6 +200,9 @@ export interface SearchContext {
     source: "filename" | "content";
   };
   context: string;
+  /** For a content match, the headings it sits under ("Setup > Docker"); absent
+   *  above the first heading and for filename matches. */
+  heading?: string;
 }
 
 export interface SearchResponseItem {
@@ -218,8 +221,12 @@ export interface SimpleSearchOptions {
   contextLength?: number;
   /** The most files to return, keeping the highest-scoring ones. Unlimited when absent. */
   maxResults?: number;
-  /** The most matches to return for each file, in document order. Unlimited when absent. */
+  /** The most matches to return for each file, best first. Unlimited when absent. */
   maxMatchesPerFile?: number;
+  /** Only notes under this folder (compared ignoring case and diacritics). */
+  path?: string;
+  /** Only notes carrying any of these tags; "ai" also matches "ai/rag". */
+  tags?: string[];
 }
 
 export interface SimpleSearchResult {

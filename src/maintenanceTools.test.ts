@@ -1,0 +1,147 @@
+import { App, TFile } from "../mocks/obsidian";
+import { VaultOperations } from "./vaultOperations";
+import { LocalRestApiSettings } from "./types";
+
+interface Fixture {
+  path: string;
+  content: string;
+  frontmatter?: Record<string, unknown>;
+  tags?: string[];
+  mtime?: number;
+}
+
+function setup(fixtures: Fixture[]) {
+  const app = new App();
+  const files = fixtures.map((f) => {
+    const t = new TFile();
+    t.path = f.path;
+    t.basename = f.path.split("/").pop().replace(/\.md$/, "");
+    t.stat = { ctime: f.mtime ?? 0, mtime: f.mtime ?? 0, size: f.content.length };
+    return t;
+  });
+  const contents = new Map(fixtures.map((f) => [f.path, f.content]));
+  const meta = new Map(fixtures.map((f) => [f.path, f]));
+  app.vault._files = files;
+  app.vault._markdownFiles = files;
+  app.vault.read = async (f: TFile) => contents.get(f.path) ?? "";
+  app.vault.cachedRead = app.vault.read;
+  app.vault.modify = async (f: TFile, c: string) => {
+    contents.set(f.path, c);
+  };
+  app.vault.getAbstractFileByPath = ((p: string) => files.find((f) => f.path === p) ?? null);
+  app.metadataCache.getFileCache = ((f: TFile) => {
+    const m = meta.get(f.path);
+    return {
+      frontmatter: m?.frontmatter,
+      tags: (m?.tags ?? []).map((tag) => ({ tag })),
+    };
+  }) as never;
+  const settings = { excludedPaths: ["Private/**"] } as LocalRestApiSettings;
+  return { app, ops: new VaultOperations(app, settings), contents };
+}
+
+describe("lintVault", () => {
+  test("reports each check with counts, ignoring excluded paths", async () => {
+    const { app, ops } = setup([
+      { path: "Thể chế hoá.md", content: "x".repeat(400), frontmatter: { description: "d" } },
+      { path: "Resources/Thể chế hóa.md", content: "short" },
+      { path: "a.md", content: "y".repeat(400), frontmatter: { description: "A", ai_summary: true }, tags: ["#AI"] },
+      { path: "b.md", content: "z".repeat(400), tags: ["#ai"] },
+      { path: "Private/p.md", content: "secret" },
+    ]);
+    app.metadataCache.resolvedLinks = { "a.md": { "b.md": 1 } };
+    app.metadataCache.unresolvedLinks = { "a.md": { "Missing note": 1 } };
+    const r = await ops.lintVault();
+    expect(r.unresolvedLinks.items).toEqual([{ path: "a.md", link: "Missing note" }]);
+    expect(r.orphans.items).toEqual(["Thể chế hoá.md", "Resources/Thể chế hóa.md"]);
+    expect(r.stubs.items).toEqual([{ path: "Resources/Thể chế hóa.md", bytes: 5 }]);
+    expect(r.missingDescription.items).toEqual(["b.md"]);
+    expect(r.unreviewedAiSummaries.count).toBe(1);
+    expect(r.duplicateTitles.items).toEqual([["Thể chế hoá.md", "Resources/Thể chế hóa.md"]]);
+    expect(r.tagVariants.items).toEqual([{ AI: 1, ai: 1 }]);
+    expect(JSON.stringify(r)).not.toContain("Private");
+  });
+});
+
+describe("recentChanges", () => {
+  test("lists notes changed in the window, newest first", async () => {
+    const now = Date.now();
+    const { ops } = setup([
+      { path: "old.md", content: "Old note", mtime: now - 30 * 86_400_000 },
+      { path: "new.md", content: "New note", mtime: now - 3_600_000 },
+      { path: "mid.md", content: "Mid note", mtime: now - 2 * 86_400_000 },
+      { path: "Private/x.md", content: "secret", mtime: now },
+    ]);
+    const r = await ops.recentChanges({ since: "7d" });
+    expect(r.notes.map((n) => n.path)).toEqual(["new.md", "mid.md"]);
+    expect(r.notes[0].description).toBe("New note");
+    await expect(ops.recentChanges({ since: "yesterday-ish" })).rejects.toThrow(/since/);
+  });
+});
+
+describe("updateFrontmatterMany", () => {
+  const fixtures = (): Fixture[] => [
+    { path: "a.md", content: "---\ntags:\n  - x\n---\nBody A\n" },
+    { path: "b.md", content: "Body B\n" },
+  ];
+
+  test("a dry run reports before/after and writes nothing", async () => {
+    const { ops, contents } = setup(fixtures());
+    const r = await ops.updateFrontmatterMany([{ path: "a.md", set: { description: "Mô tả" } }], true);
+    expect(r).toEqual([{ path: "a.md", changed: true, before: {}, after: { description: "Mô tả" } }]);
+    expect(contents.get("a.md")).toBe("---\ntags:\n  - x\n---\nBody A\n");
+  });
+
+  test("applies set and unset, creating frontmatter when missing, and reports per-file errors", async () => {
+    const { ops, contents } = setup(fixtures());
+    const r = await ops.updateFrontmatterMany(
+      [
+        { path: "a.md", set: { description: "A" }, unset: ["tags"] },
+        { path: "b.md", set: { description: "B", ai_summary: true } },
+        { path: "missing.md", set: { description: "?" } },
+        { path: "Private/p.md", set: { description: "no" } },
+      ],
+      false,
+    );
+    expect(contents.get("a.md")).toBe("---\ndescription: A\n---\nBody A\n");
+    expect(contents.get("b.md")).toMatch(/^---\ndescription: B\nai_summary: true\n---\nBody B/);
+    expect(r[2].error).toMatch(/not found/i);
+    expect(r[3].error).toMatch(/excluded/i);
+  });
+});
+
+describe("renameTag", () => {
+  test("renames frontmatter and inline tags case-insensitively, nested too, skipping code", async () => {
+    const { ops, contents } = setup([
+      {
+        path: "a.md",
+        content: "---\ntags:\n  - AI\n  - ai/rag\n---\nSee #AI and #ai/rag, not `#AI` or #AIX.\n```\n#AI\n```\n",
+        frontmatter: { tags: ["AI", "ai/rag"] },
+        tags: ["#AI", "#ai/rag"],
+      },
+      { path: "b.md", content: "Nothing here", tags: [] },
+    ]);
+    const dry = await ops.renameTag("ai", "ml");
+    expect(dry.files).toEqual([{ path: "a.md", frontmatter: 2, inline: 2 }]);
+    expect(contents.get("a.md")).toContain("#AI and");
+    await ops.renameTag("ai", "ml", { dryRun: false });
+    expect(contents.get("a.md")).toBe(
+      "---\ntags:\n  - ml\n  - ml/rag\n---\nSee #ml and #ml/rag, not `#AI` or #AIX.\n```\n#AI\n```\n",
+    );
+  });
+});
+
+describe("simpleSearch filters and headings", () => {
+  test("path and tags narrow results; content matches carry their heading", async () => {
+    const { ops } = setup([
+      { path: "Resources/aws.md", content: "# AWS\n## Storage\nS3 is object storage.\n", tags: ["#aws"] },
+      { path: "notes/s3.md", content: "S3 bucket notes", tags: [] },
+    ]);
+    const all = await ops.simpleSearch("S3");
+    expect(all.results).toHaveLength(2);
+    const filtered = await ops.simpleSearch("S3", { path: "resources", tags: ["aws"] });
+    expect(filtered.results.map((r) => r.filename)).toEqual(["Resources/aws.md"]);
+    const match = filtered.results[0].matches.find((m) => m.match.source === "content");
+    expect(match?.heading).toBe("AWS > Storage");
+  });
+});

@@ -1376,6 +1376,107 @@ export class McpHandler {
     );
 
     this.tool(
+      "vault_lint",
+      dedent`
+        Health report on the vault, or on one folder: unresolvedLinks (links to notes that do not exist), orphans (notes with no links in or out), stubs (notes under stubBytes), missingDescription (no frontmatter description/summary/tldr), unreviewedAiSummaries (ai_summary: true), duplicateTitles (names equal once case and diacritics are ignored, e.g. "hoá"/"hóa"), and tagVariants (tags differing only in case or _/-). Each check gives a count and up to limit items. It only reports -- fix with vault_patch, frontmatter_update_many or tag_rename, and ask the owner before deleting or merging notes. Excluded paths are not inspected.
+      `,
+      {
+        path: z.string().optional().describe("Folder to inspect (default: the whole vault)"),
+        limit: z.number().int().min(1).max(500).optional().describe("The most items to list per check (default 50)"),
+        stubBytes: z.number().int().min(1).max(10_000).optional().describe("Size below which a note counts as a stub (default 300)"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ path, limit, stubBytes }: { path?: string; limit?: number; stubBytes?: number }) =>
+        this.text(
+          await this.ops.lintVault({
+            ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
+            limit,
+            stubBytes,
+          }),
+        ),
+    );
+
+    this.tool(
+      "recent_changes",
+      dedent`
+        Notes modified since a point in time, newest first, each with its ISO modified time, whether it was also created in that window, and its one-line description. since is an ISO date/time or a span like "36h", "7d", "2w" (default "7d"). Use it to pick up where the vault left off instead of rescanning everything.
+      `,
+      {
+        since: z.string().optional().describe('ISO date/time, or a span such as "36h", "7d", "2w" (default "7d")'),
+        path: z.string().optional().describe("Only notes under this folder"),
+        limit: z.number().int().min(1).max(500).optional().describe("The most notes to return (default 50)"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ since, path, limit }: { since?: string; path?: string; limit?: number }) =>
+        this.text(
+          await this.ops.recentChanges({
+            since,
+            limit,
+            ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
+          }),
+        ),
+    );
+
+    this.tool(
+      "frontmatter_update_many",
+      dedent`
+        Set or remove frontmatter fields on up to 200 notes in one call -- each note is rewritten once, with the rest of its frontmatter and body untouched. Each update names a path, set (fields to create or replace; any JSON value) and/or unset (field names to remove). dryRun defaults to TRUE: the first call only reports, per note, the fields before and after; call again with dryRun false to write. A note that cannot be read or patched reports an error without stopping the others. To rename a tag across the vault use tag_rename instead.
+      `,
+      {
+        updates: z
+          .array(
+            z.object({
+              path: z.string(),
+              set: z.record(z.string(), z.unknown()).optional(),
+              unset: z.array(z.string()).optional(),
+            }),
+          )
+          .min(1)
+          .max(200)
+          .describe("One entry per note"),
+        dryRun: z.boolean().optional().describe("Report without writing (default true)"),
+      },
+      { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      async ({
+        updates,
+        dryRun = true,
+      }: {
+        updates: Array<{ path: string; set?: Record<string, unknown>; unset?: string[] }>;
+        dryRun?: boolean;
+      }) => {
+        const checked = updates.map((u) => {
+          try {
+            return { ...u, path: this.vaultPath(u.path) };
+          } catch (error) {
+            return { ...u, refused: error instanceof Error ? error.message : String(error) };
+          }
+        });
+        const allowed = checked.filter((u): u is typeof u & { refused?: undefined } => !("refused" in u));
+        const results = await this.ops.updateFrontmatterMany(allowed, dryRun);
+        const refused = checked
+          .filter((u): u is typeof u & { refused: string } => "refused" in u)
+          .map((u) => ({ path: u.path, changed: false, error: u.refused }));
+        return this.text({ dryRun, results: [...results, ...refused] });
+      },
+    );
+
+    this.tool(
+      "tag_rename",
+      dedent`
+        Rename a tag across the vault: in frontmatter tags lists and as inline #tag in note bodies (outside code), matching case-insensitively. With nested (default true), "from/x" becomes "to/x" as well. dryRun defaults to TRUE and lists the notes that would change with how many occurrences each; call again with dryRun false to write. Renaming onto an existing tag merges them. Excluded notes are not touched.
+      `,
+      {
+        from: z.string().describe("The tag to rename, with or without '#'"),
+        to: z.string().describe("The new tag name, without spaces"),
+        nested: z.boolean().optional().describe("Also rename nested tags under it (default true)"),
+        dryRun: z.boolean().optional().describe("Report without writing (default true)"),
+      },
+      { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      async ({ from, to, nested, dryRun = true }: { from: string; to: string; nested?: boolean; dryRun?: boolean }) =>
+        this.text(await this.ops.renameTag(from, to, { dryRun, nested })),
+    );
+
+    this.tool(
       "vault_read",
       dedent`
         Read a vault file's content and metadata. Returns a JSON object with: content (full markdown text), path, tags (array of tag strings), frontmatter (parsed YAML front-matter as an object), stat ({ctime, mtime, size}), links (array of vault-relative paths this file links to), backlinks (array of vault-relative paths of files that link here), unresolvedLinks (array of link text in this file that does not resolve to an existing vault file), and version (the file's version token -- pass it back as ifMatch to vault_write, vault_append, vault_patch, vault_delete, vault_move or vault_copy so that write fails, rather than overwriting someone else's change, if the file has changed in between). Throws if the file does not exist. The three link fields reflect Obsidian's metadata cache as it stands and may be incomplete while Obsidian is still indexing the vault after startup; the server-status resource (obsidian://local-rest-api/status) reports, under state.metadataCache, when the plugin last heard the cache resolve and when it last heard any indexing activity.
@@ -1910,9 +2011,11 @@ export class McpHandler {
 
     this.tool(
       "search_simple",
-      dedent`Ranked full-text search over the vault (BM25 over note name, aliases, headings, tags, frontmatter description/summary and body; the note name weighs most). Works for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics ("san pham" finds "sản phẩm"), old and new tone placement are the same word ("hoá" = "hóa"), and exact-accent and whole-phrase matches rank above loose ones; a note matching only some of the query's words ranks lower. Returns an array of {filename, score, matches, totalMatches} objects sorted by score, highest first. Each match includes the matched text and surrounding context characters (controlled by contextLength); a file's matches come best first (whole phrases, then exact-accent words, then the rest). Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the best ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
+      dedent`Ranked full-text search over the vault (BM25 over note name, aliases, headings, tags, frontmatter description/summary and body; the note name weighs most). Works for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics ("san pham" finds "sản phẩm"), old and new tone placement are the same word ("hoá" = "hóa"), and exact-accent and whole-phrase matches rank above loose ones; a note matching only some of the query's words ranks lower. Returns an array of {filename, score, matches, totalMatches} objects sorted by score, highest first. Each match includes the matched text and surrounding context characters (controlled by contextLength); a file's matches come best first (whole phrases, then exact-accent words, then the rest), and a content match carries the heading path it sits under. Narrow with path (a folder) and tags. Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the best ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
       {
         query: z.string().describe("Search query string"),
+        path: z.string().optional().describe("Only notes under this folder, e.g. \"Resources/\" (compared ignoring case and diacritics)"),
+        tags: z.array(z.string()).optional().describe("Only notes having any of these tags; \"ai\" also matches \"ai/rag\""),
         contextLength: z
           .number()
           .int()
@@ -1936,11 +2039,15 @@ export class McpHandler {
       READ_ONLY_ANNOTATIONS,
       async ({
         query,
+        path,
+        tags,
         contextLength,
         maxResults = SEARCH_SIMPLE_DEFAULT_MAX_RESULTS,
         maxMatchesPerFile = SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE,
       }: {
         query: string;
+        path?: string;
+        tags?: string[];
         contextLength?: number;
         maxResults?: number;
         maxMatchesPerFile?: number;
@@ -1949,6 +2056,8 @@ export class McpHandler {
           contextLength,
           maxResults,
           maxMatchesPerFile,
+          ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
+          ...(tags && tags.length ? { tags } : {}),
         });
         const result = this.text(results);
         const omittedFiles = totalResults - results.length;

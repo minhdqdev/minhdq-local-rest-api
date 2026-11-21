@@ -478,7 +478,16 @@ Three read-only tools this fork adds so an agent can find its way around a vault
 - `vault_read_many` — up to 25 notes in one call, each cut to `maxCharsPerFile`, with a per-file `error` instead of failing the batch.
 - `vault_neighbors` — a note's links and backlinks (and, with `depth: 2`, the notes one hop further), each with its description.
 
-All three honour excluded paths and the configuration-directory guard. They are MCP-only; there is no REST route for them.
+And four for upkeep:
+
+- `vault_lint` — a health report: unresolved links, orphans, stubs, notes without a description, unreviewed `ai_summary` descriptions, names that collide once case and diacritics are ignored, and tag spelling variants. Reports only.
+- `recent_changes` — notes modified since an ISO time or a span like `7d`, newest first, with descriptions.
+- `frontmatter_update_many` — set/unset frontmatter fields on up to 200 notes in one call; dry run by default.
+- `tag_rename` — rename (or merge) a tag in frontmatter and inline `#tag`s, nested tags included; dry run by default.
+
+`search_simple` also takes `path` and `tags` filters, and each content match carries the heading path it sits under.
+
+All of these honour excluded paths and the configuration-directory guard. They are MCP-only; there is no REST route for them.
 
 ### Binary files and attachments
 

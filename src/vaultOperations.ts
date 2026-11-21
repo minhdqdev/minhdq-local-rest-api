@@ -9,6 +9,8 @@ import {
 } from "obsidian";
 import { VaultSearch } from "./fts/vaultSearch";
 import { findMatches } from "./fts/matches";
+import { foldText } from "./fts/text";
+import { parse as parseYaml } from "yaml";
 import path from "path";
 import {
   applyPatch,
@@ -818,6 +820,199 @@ export class VaultOperations {
     return result;
   }
 
+  /** Notes changed since `since` (newest first), for an agent picking up where the
+   *  vault left off. `since` is an ISO date/time or a relative span: "36h", "7d",
+   *  "2w". Excluded paths never appear. */
+  async recentChanges(
+    { since = "7d", limit = 50, path: dirPath = "" }: { since?: string; limit?: number; path?: string } = {},
+  ): Promise<{ since: string; total: number; notes: Array<{ path: string; modified: string; created: boolean; description: string }> }> {
+    if (dirPath) this.assertContained(dirPath, "Directory path");
+    const cutoff = parseSince(since);
+    const prefix = dirPath ? `${dirPath.replace(/\/+$/, "")}/` : "";
+    const changed = this.readableMarkdownFiles()
+      .filter((f) => f.path.startsWith(prefix) && f.stat.mtime >= cutoff)
+      .sort((a, b) => b.stat.mtime - a.stat.mtime);
+    const notes = [];
+    for (const f of changed.slice(0, Math.max(1, limit))) {
+      notes.push({
+        path: f.path,
+        modified: new Date(f.stat.mtime).toISOString(),
+        created: f.stat.ctime >= cutoff,
+        description: await this.noteDescription(f),
+      });
+    }
+    return { since: new Date(cutoff).toISOString(), total: changed.length, notes };
+  }
+
+  /** A health report on the vault (or one folder of it): what an agent or the owner
+   *  should look at, never fixed automatically. Each check lists up to `limit`
+   *  items and counts all of them. Excluded paths are not inspected. */
+  async lintVault(
+    { path: dirPath = "", limit = 50, stubBytes = 300 }: { path?: string; limit?: number; stubBytes?: number } = {},
+  ): Promise<Record<string, { count: number; items: unknown[] }>> {
+    if (dirPath) this.assertContained(dirPath, "Directory path");
+    const prefix = dirPath ? `${dirPath.replace(/\/+$/, "")}/` : "";
+    const files = this.readableMarkdownFiles().filter((f) => f.path.startsWith(prefix));
+    const readable = new Set(this.readableMarkdownFiles().map((f) => f.path));
+    const backlinks = this.getBacklinksIndex();
+    const report: Record<string, { count: number; items: unknown[] }> = {};
+    const add = (check: string, item: unknown) => {
+      const r = (report[check] ??= { count: 0, items: [] });
+      r.count++;
+      if (r.items.length < limit) r.items.push(item);
+    };
+    const titles = new Map<string, string[]>();
+    const tagSpellings = new Map<string, Map<string, number>>();
+    for (const f of files) {
+      const cache = this.app.metadataCache.getFileCache(f);
+      const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
+      for (const link of Object.keys(this.app.metadataCache.unresolvedLinks[f.path] ?? {})) {
+        add("unresolvedLinks", { path: f.path, link });
+      }
+      const out = Object.keys(this.app.metadataCache.resolvedLinks[f.path] ?? {}).filter(
+        (t) => t !== f.path && readable.has(t),
+      );
+      const inbound = (backlinks[f.path] ?? []).filter((src) => src !== f.path && readable.has(src));
+      if (out.length === 0 && inbound.length === 0) add("orphans", f.path);
+      if (f.stat.size < stubBytes) add("stubs", { path: f.path, bytes: f.stat.size });
+      const hasDescription = ["description", "summary", "tldr"].some(
+        (k) => typeof fm[k] === "string" && (fm[k]).trim() !== "",
+      );
+      if (!hasDescription && f.stat.size >= stubBytes) add("missingDescription", f.path);
+      if (fm.ai_summary === true) add("unreviewedAiSummaries", { path: f.path, description: fm.description });
+      const key = foldText(f.basename);
+      titles.set(key, [...(titles.get(key) ?? []), f.path]);
+      for (const tag of cache ? (getAllTags(cache) ?? []) : []) {
+        const name = tag.replace(/^#/, "");
+        const norm = name.toLowerCase().replace(/_/g, "-");
+        const spellings = tagSpellings.get(norm) ?? new Map<string, number>();
+        spellings.set(name, (spellings.get(name) ?? 0) + 1);
+        tagSpellings.set(norm, spellings);
+      }
+    }
+    for (const paths of titles.values()) if (paths.length > 1) add("duplicateTitles", paths);
+    for (const spellings of tagSpellings.values()) {
+      if (spellings.size > 1) add("tagVariants", Object.fromEntries(spellings));
+    }
+    for (const check of [
+      "unresolvedLinks", "orphans", "stubs", "missingDescription",
+      "unreviewedAiSummaries", "duplicateTitles", "tagVariants",
+    ]) report[check] ??= { count: 0, items: [] };
+    return report;
+  }
+
+  /** Set or remove frontmatter fields on many notes in one call, each note in one
+   *  write. With `dryRun` nothing is written and each entry shows the fields before
+   *  and after. A note that cannot be read or patched reports an error and does not
+   *  stop the others. */
+  async updateFrontmatterMany(
+    updates: Array<{ path: string; set?: Record<string, unknown>; unset?: string[] }>,
+    dryRun: boolean,
+  ): Promise<Array<{ path: string; changed: boolean; before?: Record<string, unknown>; after?: Record<string, unknown>; error?: string }>> {
+    const results = [];
+    for (const update of updates) {
+      try {
+        this.assertContained(update.path);
+        const result = await this.withPathLocks([update.path], async () => {
+          const file = this.app.vault.getAbstractFileByPath(update.path);
+          if (!(file instanceof TFile)) throw new FileNotFoundError(`File not found: ${update.path}`);
+          const original = await this.app.vault.read(file);
+          let doc = original;
+          const keys = [...Object.keys(update.set ?? {}), ...(update.unset ?? [])];
+          const before = pickFrontmatter(doc, keys);
+          for (const [key, value] of Object.entries(update.set ?? {})) {
+            doc = patchV2(doc, {
+              targetType: "frontmatter", target: key, operation: "replace", value, createTargetIfMissing: true,
+            }).document;
+          }
+          for (const key of update.unset ?? []) {
+            if (!(key in pickFrontmatter(doc, [key]))) continue;
+            doc = patchV2(doc, {
+              targetType: "frontmatter", target: key, operation: "delete", scope: "markerAndContent",
+            }).document;
+          }
+          const changed = doc !== original;
+          if (changed && !dryRun) await this.app.vault.modify(file, doc);
+          return { path: update.path, changed, before, after: pickFrontmatter(doc, keys) };
+        });
+        results.push(result);
+      } catch (error) {
+        results.push({ path: update.path, changed: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return results;
+  }
+
+  /** Rename a tag everywhere: in frontmatter `tags` lists and as inline `#tag` in
+   *  the body (outside code), matching case-insensitively. With `nested`, `from/x`
+   *  becomes `to/x` too. With `dryRun` nothing is written. Excluded notes are not
+   *  touched. */
+  async renameTag(
+    from: string,
+    to: string,
+    { dryRun = true, nested = true }: { dryRun?: boolean; nested?: boolean } = {},
+  ): Promise<{ from: string; to: string; dryRun: boolean; files: Array<{ path: string; frontmatter: number; inline: number }> }> {
+    const src = from.replace(/^#/, "").trim();
+    const dst = to.replace(/^#/, "").trim();
+    if (!src || !dst || /\s/.test(dst)) throw new Error("from and to must be non-empty tag names without spaces.");
+    const lower = src.toLowerCase();
+    const rename = (tag: string): string | null => {
+      const t = tag.replace(/^#/, "");
+      const l = t.toLowerCase();
+      if (l === lower) return dst;
+      if (nested && l.startsWith(`${lower}/`)) return dst + t.slice(src.length);
+      return null;
+    };
+    const inlineRe = new RegExp(
+      `(?<![\\p{L}\\p{N}_/&#\\]])#(${escapeRegExp(src)}${nested ? "(?:/[\\p{L}\\p{N}_\\-/]+)?" : ""})(?![\\p{L}\\p{N}_\\-/])`,
+      "giu",
+    );
+    const files = [];
+    for (const file of this.readableMarkdownFiles()) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const tags = cache ? (getAllTags(cache) ?? []) : [];
+      if (!tags.some((t) => rename(t) !== null)) continue;
+      const outcome = await this.withPathLocks([file.path], async () => {
+        const original = await this.app.vault.read(file);
+        let doc = original;
+        let fmCount = 0;
+        const fmTags: unknown = (cache?.frontmatter as Record<string, unknown> | undefined)?.tags;
+        const list: unknown[] | null = Array.isArray(fmTags)
+          ? (fmTags as unknown[])
+          : typeof fmTags === "string"
+            ? fmTags.split(/[,\s]+/).filter(Boolean)
+            : null;
+        if (list) {
+          const next = list.map((t) => {
+            const r = typeof t === "string" ? rename(t) : null;
+            if (r !== null) fmCount++;
+            return r ?? t;
+          });
+          if (fmCount > 0) {
+            const deduped = next.filter((t, i) => next.indexOf(t) === i);
+            doc = patchV2(doc, { targetType: "frontmatter", target: "tags", operation: "replace", value: deduped }).document;
+          }
+        }
+        const fmEnd = frontmatterEnd(doc);
+        let inline = 0;
+        const parts = doc.slice(fmEnd).split(/(```[\s\S]*?```|`[^`\n]*`)/);
+        for (let i = 0; i < parts.length; i += 2) {
+          parts[i] = parts[i].replace(inlineRe, (_m, tag: string) => {
+            const r = rename(tag);
+            if (r === null) return _m;
+            inline++;
+            return `#${r}`;
+          });
+        }
+        doc = doc.slice(0, fmEnd) + parts.join("");
+        if (doc !== original && !dryRun) await this.app.vault.modify(file, doc);
+        return { path: file.path, frontmatter: fmCount, inline };
+      });
+      if (outcome.frontmatter + outcome.inline > 0) files.push(outcome);
+    }
+    return { from: src, to: dst, dryRun, files };
+  }
+
   async listVaultDirectory(dirPath: string): Promise<string[]> {
     this.assertContained(dirPath, "Directory path");
     const normalizedPath = dirPath.endsWith("/")
@@ -1263,10 +1458,15 @@ export class VaultOperations {
       contextLength = 100,
       maxResults = Infinity,
       maxMatchesPerFile = Infinity,
+      path: folder,
+      tags,
     }: SimpleSearchOptions = {},
   ): Promise<SimpleSearchResult> {
+    if (folder) this.assertContained(folder, "Directory path");
     const { total, hits } = await this.vaultSearch.search(query, {
       limit: Number.isFinite(maxResults) ? maxResults : undefined,
+      path: folder || undefined,
+      tags: tags && tags.length ? tags : undefined,
     });
     const results: SearchResponseItem[] = [];
     const readable = new Map(this.readableMarkdownFiles().map((file) => [file.path, file]));
@@ -1288,9 +1488,12 @@ export class VaultOperations {
           context: basename,
         });
       }
+      const headingAt = headingLocator(content);
       for (const span of contentSpans) {
         if (contextMatches.length >= maxMatchesPerFile) break;
+        const heading = headingAt(span.start);
         contextMatches.push({
+          ...(heading ? { heading } : {}),
           match: { start: span.start, end: span.end, source: "content" },
           context: content.slice(
             ...this.widenToCodePointBoundaries(
@@ -1467,4 +1670,73 @@ function frontmatterEnd(content: string): number {
   if (end === -1) return 0;
   const after = content.indexOf("\n", end + 4);
   return after === -1 ? content.length : after + 1;
+}
+
+/** A relative span ("36h", "7d", "2w") or an ISO date/time, as epoch milliseconds. */
+function parseSince(since: string): number {
+  const m = /^(\d+)\s*([hdw])$/i.exec(since.trim());
+  if (m) {
+    const n = Number(m[1]);
+    const unit = { h: 3_600_000, d: 86_400_000, w: 604_800_000 }[m[2].toLowerCase() as "h" | "d" | "w"];
+    return Date.now() - n * unit;
+  }
+  const t = Date.parse(since);
+  if (Number.isNaN(t)) throw new Error(`since: expected an ISO date or a span like "7d", got "${since}"`);
+  return t;
+}
+
+/** The named top-level frontmatter fields of a document, parsed. Absent fields are
+ *  left out. */
+function pickFrontmatter(doc: string, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const end = frontmatterEnd(doc);
+  if (keys.length === 0 || end === 0) return out;
+  let fm: unknown;
+  try {
+    fm = parseYaml(doc.slice(4, doc.lastIndexOf("\n---", end)));
+  } catch {
+    return out;
+  }
+  if (!fm || typeof fm !== "object") return out;
+  for (const k of keys) if (k in (fm as Record<string, unknown>)) out[k] = (fm as Record<string, unknown>)[k];
+  return out;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** A function from an offset in `content` to the heading path it sits under
+ *  ("Setup > Docker"), or "" above the first heading. Headings inside code fences
+ *  are ignored. */
+function headingLocator(content: string): (offset: number) => string {
+  const marks: Array<{ offset: number; path: string }> = [];
+  const stack: Array<{ level: number; text: string }> = [];
+  let inCode = false;
+  let offset = 0;
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) inCode = !inCode;
+    const h = !inCode && /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(trimmed);
+    if (h) {
+      const level = h[1].length;
+      while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
+      stack.push({ level, text: h[2] });
+      marks.push({ offset, path: stack.map((s) => s.text).join(" > ") });
+    }
+    offset += line.length + 1;
+  }
+  return (at: number) => {
+    let lo = 0;
+    let hi = marks.length - 1;
+    let found = "";
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (marks[mid].offset <= at) {
+        found = marks[mid].path;
+        lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    return found;
+  };
 }

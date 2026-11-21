@@ -86,6 +86,10 @@ function makeMockOps() {
     listVaultDirectory: jest.fn().mockResolvedValue(["file1.md", "folder/"]),
     vaultTree: jest.fn().mockResolvedValue({ tree: "/ (1 notes)\n  a.md — A", entries: 1, omitted: 0 }),
     noteNeighbors: jest.fn().mockResolvedValue({ path: "a.md", links: [], backlinks: [], omitted: 0 }),
+    lintVault: jest.fn().mockResolvedValue({ orphans: { count: 0, items: [] } }),
+    recentChanges: jest.fn().mockResolvedValue({ since: "2026-11-15T00:00:00.000Z", total: 0, notes: [] }),
+    updateFrontmatterMany: jest.fn().mockResolvedValue([]),
+    renameTag: jest.fn().mockResolvedValue({ from: "a", to: "b", dryRun: true, files: [] }),
     getFileMetadataObject: jest.fn().mockResolvedValue({
       content: "hello",
       tags: [],
@@ -303,8 +307,8 @@ describe("McpHandler", () => {
 
   // ---- tool registration --------------------------------------------------
 
-  test("registers all 22 tools (the two signed-URL tools are there because that setting is on by default)", () => {
-    expect(registerTool).toHaveBeenCalledTimes(22);
+  test("registers all 26 tools (the two signed-URL tools are there because that setting is on by default)", () => {
+    expect(registerTool).toHaveBeenCalledTimes(26);
     const names = registerTool.mock.calls.map((c: unknown[]) => c[0]);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -314,6 +318,10 @@ describe("McpHandler", () => {
         "vault_tree",
         "vault_read_many",
         "vault_neighbors",
+        "vault_lint",
+        "recent_changes",
+        "frontmatter_update_many",
+        "tag_rename",
         "vault_read",
         "vault_read_binary",
         "vault_write",
@@ -343,6 +351,8 @@ describe("McpHandler", () => {
         "vault_tree",
         "vault_read_many",
         "vault_neighbors",
+        "vault_lint",
+        "recent_changes",
         "vault_read",
         "vault_read_binary",
         "vault_get_document_map",
@@ -889,12 +899,12 @@ describe("McpHandler", () => {
       build(UNSIGNED);
       expect(registeredNames()).not.toContain("vault_get_download_url");
       expect(registeredNames()).not.toContain("vault_get_upload_url");
-      expect(registerTool).toHaveBeenCalledTimes(20);
+      expect(registerTool).toHaveBeenCalledTimes(24);
       build();
       expect(registeredNames()).toEqual(
         expect.arrayContaining(["vault_get_download_url", "vault_get_upload_url"]),
       );
-      expect(registerTool).toHaveBeenCalledTimes(22);
+      expect(registerTool).toHaveBeenCalledTimes(26);
     });
 
     test("setSignedUrlsEnabled adds and removes the tools without rebuilding the handler", () => {
@@ -2102,6 +2112,42 @@ describe("McpHandler", () => {
     });
   });
 
+  describe("maintenance tools", () => {
+    beforeEach(() => {
+      registerTool.mockClear();
+      buildServer(new McpHandler(ops, { ...DEFAULT_SETTINGS, excludedPaths: ["Private/**"] }));
+    });
+
+    test("frontmatter_update_many defaults to a dry run and refuses excluded paths per entry", async () => {
+      const result = await getToolCallback("frontmatter_update_many")({
+        updates: [
+          { path: "a.md", set: { description: "x" } },
+          { path: "Private/b.md", set: { description: "y" } },
+        ],
+      });
+      expect(ops.updateFrontmatterMany).toHaveBeenCalledWith([{ path: "a.md", set: { description: "x" } }], true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.dryRun).toBe(true);
+      expect(body.results).toEqual([{ path: "Private/b.md", changed: false, error: expect.stringMatching(/excluded/i) }]);
+    });
+
+    test("tag_rename defaults to a dry run", async () => {
+      await getToolCallback("tag_rename")({ from: "AI", to: "ai" });
+      expect(ops.renameTag).toHaveBeenCalledWith("AI", "ai", { dryRun: true, nested: undefined });
+    });
+
+    test("vault_lint and recent_changes refuse an excluded folder", async () => {
+      await expect(getToolCallback("vault_lint")({ path: "Private" })).rejects.toThrow(/excluded/i);
+      await expect(getToolCallback("recent_changes")({ path: "Private" })).rejects.toThrow(/excluded/i);
+    });
+
+    test("search_simple passes path and tags through", async () => {
+      ops.simpleSearch = jest.fn().mockResolvedValue({ results: [], totalResults: 0 });
+      await getToolCallback("search_simple")({ query: "x", path: "Resources", tags: ["ai"] });
+      expect(ops.simpleSearch).toHaveBeenCalledWith("x", expect.objectContaining({ path: "Resources", tags: ["ai"] }));
+    });
+  });
+
   // ---- excluded paths --------------------------------------------------------
 
   describe("excluded paths", () => {
@@ -2460,8 +2506,8 @@ describe("McpHandler", () => {
 
       const first = await send(1);
       const second = await send(2);
-      expect(first.body.result.tools).toHaveLength(22);
-      expect(second.body.result.tools).toHaveLength(22);
+      expect(first.body.result.tools).toHaveLength(26);
+      expect(second.body.result.tools).toHaveLength(26);
       expect(first.headers["mcp-session-id"]).toBeUndefined();
       expect(second.headers["mcp-session-id"]).toBeUndefined();
     });
@@ -2623,7 +2669,7 @@ describe("McpHandler", () => {
         .send(sessionlessRequest(1, "tools/list"))
         .expect(200);
 
-      expect(res.body.result.tools).toHaveLength(22);
+      expect(res.body.result.tools).toHaveLength(26);
       expect(res.headers["mcp-session-id"]).toBeUndefined();
     });
 
@@ -2751,7 +2797,7 @@ describe("McpHandler", () => {
         .expect(200);
 
       const message = sseResult(res.text);
-      expect(message.result.tools).toHaveLength(22);
+      expect(message.result.tools).toHaveLength(26);
       const vaultList = (message.result.tools as { name: string; inputSchema: unknown }[]).find(
         (t) => t.name === "vault_list",
       );
