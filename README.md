@@ -480,7 +480,7 @@ Three read-only tools this fork adds so an agent can find its way around a vault
 
 And four for upkeep:
 
-- `vault_lint` — a health report: unresolved links, orphans, stubs, notes without a description, unreviewed `ai_summary` descriptions, names that collide once case and diacritics are ignored, and tag spelling variants. Reports only.
+- `vault_lint` — a health report: unresolved links, orphans, stubs, notes without a description, unreviewed `ai_summary` descriptions, names that collide once case and diacritics are ignored, tag spelling variants, and broken frontmatter (stray text before `---`, or YAML that does not parse). Reports only.
 - `recent_changes` — notes modified since an ISO time or a span like `7d`, newest first, with descriptions.
 - `frontmatter_update_many` — set/unset frontmatter fields on up to 200 notes in one call; dry run by default.
 - `tag_rename` — rename (or merge) a tag in frontmatter and inline `#tag`s, nested tags included; dry run by default.
@@ -488,6 +488,8 @@ And four for upkeep:
 `search_simple` also takes `path` and `tags` filters, and each content match carries the heading path it sits under.
 
 All of these honour excluded paths and the configuration-directory guard. They are MCP-only; there is no REST route for them.
+
+**Search log.** Each simple search is appended to `search-log.jsonl` in the plugin's folder (query, filters, hit count, top three notes), to show which searches come back empty or weak. The file sits in the configuration directory, out of reach of API clients; turn it off under Settings → Log searches.
 
 ### Binary files and attachments
 

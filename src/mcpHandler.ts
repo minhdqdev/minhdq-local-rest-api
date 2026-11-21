@@ -1378,7 +1378,7 @@ export class McpHandler {
     this.tool(
       "vault_lint",
       dedent`
-        Health report on the vault, or on one folder: unresolvedLinks (links to notes that do not exist), orphans (notes with no links in or out), stubs (notes under stubBytes), missingDescription (no frontmatter description/summary/tldr), unreviewedAiSummaries (ai_summary: true), duplicateTitles (names equal once case and diacritics are ignored, e.g. "hoá"/"hóa"), and tagVariants (tags differing only in case or _/-). Each check gives a count and up to limit items. It only reports -- fix with vault_patch, frontmatter_update_many or tag_rename, and ask the owner before deleting or merging notes. Excluded paths are not inspected.
+        Health report on the vault, or on one folder: unresolvedLinks (links to notes that do not exist), orphans (notes with no links in or out), stubs (notes under stubBytes), missingDescription (no frontmatter description/summary/tldr), unreviewedAiSummaries (ai_summary: true), duplicateTitles (names equal once case and diacritics are ignored, e.g. "hoá"/"hóa"), tagVariants (tags differing only in case or _/-), and brokenFrontmatter (stray text before the opening ---, or YAML that does not parse -- Obsidian then ignores the note's tags and description). Each check gives a count and up to limit items. It only reports -- fix with vault_patch, frontmatter_update_many or tag_rename, and ask the owner before deleting or merging notes. Excluded paths are not inspected.
       `,
       {
         path: z.string().optional().describe("Folder to inspect (default: the whole vault)"),

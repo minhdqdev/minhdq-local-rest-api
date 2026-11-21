@@ -766,6 +766,19 @@ class LocalRestApiSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: "Log searches",
+            desc: "Append each simple search (query, filters, number of hits, top three notes) to search-log.jsonl in this plugin's folder, to see which searches come back empty or weak. The file lives in the configuration directory, so API clients cannot read it. Rotated at 5 MB.",
+            render: (setting) => {
+              setting.addToggle((toggle) => {
+                toggle.setValue(this.plugin.settings.logSearches !== false);
+                toggle.onChange(async (value) => {
+                  this.plugin.settings.logSearches = value ? undefined : false;
+                  await this.plugin.saveSettings();
+                });
+              });
+            },
+          },
+          {
             type: "page",
             name: "Advanced settings",
             desc: "Advanced settings are dangerous and may make your environment less secure.",

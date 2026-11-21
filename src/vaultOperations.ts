@@ -11,6 +11,7 @@ import { VaultSearch } from "./fts/vaultSearch";
 import { findMatches } from "./fts/matches";
 import { foldText } from "./fts/text";
 import { parse as parseYaml } from "yaml";
+import { LOCAL_REST_API_PLUGIN_ID } from "./publicApi";
 import path from "path";
 import {
   applyPatch,
@@ -880,6 +881,12 @@ export class VaultOperations {
       );
       if (!hasDescription && f.stat.size >= stubBytes) add("missingDescription", f.path);
       if (fm.ai_summary === true) add("unreviewedAiSummaries", { path: f.path, description: fm.description });
+      const head = (await this.app.vault.cachedRead(f)).slice(0, 4000);
+      if (!head.startsWith("---") && /^[^\n]{0,200}\n---\r?\n(?:[A-Za-z_][\w-]*:.*\r?\n|\s+-.*\r?\n)+---/.test(head)) {
+        add("brokenFrontmatter", { path: f.path, problem: "text before the opening ---, so Obsidian sees no frontmatter" });
+      } else if (/^---\r?\n/.test(head) && !cache?.frontmatterPosition) {
+        add("brokenFrontmatter", { path: f.path, problem: "frontmatter block does not parse as YAML" });
+      }
       const key = foldText(f.basename);
       titles.set(key, [...(titles.get(key) ?? []), f.path]);
       for (const tag of cache ? (getAllTags(cache) ?? []) : []) {
@@ -896,7 +903,7 @@ export class VaultOperations {
     }
     for (const check of [
       "unresolvedLinks", "orphans", "stubs", "missingDescription",
-      "unreviewedAiSummaries", "duplicateTitles", "tagVariants",
+      "unreviewedAiSummaries", "duplicateTitles", "tagVariants", "brokenFrontmatter",
     ]) report[check] ??= { count: 0, items: [] };
     return report;
   }
@@ -1513,7 +1520,51 @@ export class VaultOperations {
       });
     }
 
+    void this.logSearch(query, folder, tags, total, results);
     return { results, totalResults: total };
+  }
+
+  /** Append one line per simple search to `search-log.jsonl` in this plugin's own
+   *  folder (inside the configuration directory, so no API client can read it), for
+   *  the owner to see which searches come back empty or weak. Rotated at 5 MB. Off
+   *  when `logSearches` is false. Never throws: a failed log write must not fail a
+   *  search. */
+  private async logSearch(
+    query: string,
+    folder: string | undefined,
+    tags: string[] | undefined,
+    total: number,
+    results: SearchResponseItem[],
+  ): Promise<void> {
+    if (this.settings.logSearches === false) return;
+    const adapter = this.app.vault.adapter as unknown as {
+      append?: (path: string, data: string) => Promise<void>;
+      stat?: (path: string) => Promise<{ size: number } | null>;
+      rename?: (from: string, to: string) => Promise<void>;
+      exists?: (path: string) => Promise<boolean>;
+      remove?: (path: string) => Promise<void>;
+    };
+    if (typeof adapter.append !== "function") return;
+    const file = `${this.app.vault.configDir}/plugins/${LOCAL_REST_API_PLUGIN_ID}/search-log.jsonl`;
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      query,
+      ...(folder ? { path: folder } : {}),
+      ...(tags && tags.length ? { tags } : {}),
+      total,
+      top: results.slice(0, 3).map((r) => ({ path: r.filename, score: r.score })),
+    });
+    try {
+      const stat = await adapter.stat?.(file);
+      if (stat && stat.size > 5 * 1024 * 1024 && adapter.rename) {
+        const old = `${file}.1`;
+        if (adapter.exists && adapter.remove && (await adapter.exists(old))) await adapter.remove(old);
+        await adapter.rename(file, old);
+      }
+      await adapter.append(file, `${line}\n`);
+    } catch (error) {
+      console.warn("[REST API] could not write search log", error);
+    }
   }
 
   async searchJsonLogic(

@@ -145,3 +145,42 @@ describe("simpleSearch filters and headings", () => {
     expect(match?.heading).toBe("AWS > Storage");
   });
 });
+
+describe("lintVault brokenFrontmatter", () => {
+  test("flags text before the opening --- and frontmatter that does not parse", async () => {
+    const { app, ops } = setup([
+      { path: "stray.md", content: "QUic\n---\ntags:\n  - aws\n---\nbody " + "x".repeat(300) },
+      { path: "bad.md", content: "---\ntags: [unclosed\n---\nbody " + "x".repeat(300) },
+      { path: "ok.md", content: "---\ntags:\n  - a\n---\nbody " + "x".repeat(300), frontmatter: { tags: ["a"] } },
+    ]);
+    const base = app.metadataCache.getFileCache.bind(app.metadataCache);
+    app.metadataCache.getFileCache = ((f: TFile) =>
+      f.path === "ok.md" ? { ...base(f), frontmatterPosition: { start: {}, end: { offset: 20 } } } : base(f)) as never;
+    const r = await ops.lintVault();
+    expect(r.brokenFrontmatter.items).toEqual([
+      { path: "stray.md", problem: expect.stringMatching(/before the opening/) },
+      { path: "bad.md", problem: expect.stringMatching(/does not parse/) },
+    ]);
+  });
+});
+
+describe("search log", () => {
+  test("appends one JSON line per search to the plugin folder, unless turned off", async () => {
+    const { app, ops } = setup([{ path: "a.md", content: "Kubernetes security notes" }]);
+    const lines: Array<[string, string]> = [];
+    (app.vault.adapter as unknown as { append: (p: string, d: string) => Promise<void> }).append = async (p, d) => {
+      lines.push([p, d]);
+    };
+    await ops.simpleSearch("kubernetes", { path: "" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lines).toHaveLength(1);
+    expect(lines[0][0]).toBe(".obsidian/plugins/minhdq-local-rest-api/search-log.jsonl");
+    const entry = JSON.parse(lines[0][1]);
+    expect(entry).toMatchObject({ query: "kubernetes", total: 1, top: [{ path: "a.md" }] });
+
+    ops.settings.logSearches = false;
+    await ops.simpleSearch("kubernetes");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lines).toHaveLength(1);
+  });
+});

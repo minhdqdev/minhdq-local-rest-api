@@ -118,6 +118,12 @@ export interface LocalRestApiSettings {
    * Unicode normalization the way APFS/NTFS compare names.
    */
   excludedPaths?: string[];
+
+  /**
+   * Whether each simple search is appended to `search-log.jsonl` in this plugin's
+   * folder (query, filters, hit count, top three paths). On unless set to false.
+   */
+  logSearches?: boolean;
 }
 
 declare module "obsidian" {
