@@ -84,6 +84,8 @@ function makeMockOps() {
       },
     },
     listVaultDirectory: jest.fn().mockResolvedValue(["file1.md", "folder/"]),
+    vaultTree: jest.fn().mockResolvedValue({ tree: "/ (1 notes)\n  a.md — A", entries: 1, omitted: 0 }),
+    noteNeighbors: jest.fn().mockResolvedValue({ path: "a.md", links: [], backlinks: [], omitted: 0 }),
     getFileMetadataObject: jest.fn().mockResolvedValue({
       content: "hello",
       tags: [],
@@ -301,14 +303,17 @@ describe("McpHandler", () => {
 
   // ---- tool registration --------------------------------------------------
 
-  test("registers all 19 tools (the two signed-URL tools are there because that setting is on by default)", () => {
-    expect(registerTool).toHaveBeenCalledTimes(19);
+  test("registers all 22 tools (the two signed-URL tools are there because that setting is on by default)", () => {
+    expect(registerTool).toHaveBeenCalledTimes(22);
     const names = registerTool.mock.calls.map((c: unknown[]) => c[0]);
     expect(names).toEqual(
       expect.arrayContaining([
         "vault_get_download_url",
         "vault_get_upload_url",
         "vault_list",
+        "vault_tree",
+        "vault_read_many",
+        "vault_neighbors",
         "vault_read",
         "vault_read_binary",
         "vault_write",
@@ -335,6 +340,9 @@ describe("McpHandler", () => {
     test("read-only tools are annotated readOnlyHint/idempotentHint true, destructiveHint false", () => {
       for (const name of [
         "vault_list",
+        "vault_tree",
+        "vault_read_many",
+        "vault_neighbors",
         "vault_read",
         "vault_read_binary",
         "vault_get_document_map",
@@ -881,12 +889,12 @@ describe("McpHandler", () => {
       build(UNSIGNED);
       expect(registeredNames()).not.toContain("vault_get_download_url");
       expect(registeredNames()).not.toContain("vault_get_upload_url");
-      expect(registerTool).toHaveBeenCalledTimes(17);
+      expect(registerTool).toHaveBeenCalledTimes(20);
       build();
       expect(registeredNames()).toEqual(
         expect.arrayContaining(["vault_get_download_url", "vault_get_upload_url"]),
       );
-      expect(registerTool).toHaveBeenCalledTimes(19);
+      expect(registerTool).toHaveBeenCalledTimes(22);
     });
 
     test("setSignedUrlsEnabled adds and removes the tools without rebuilding the handler", () => {
@@ -2059,6 +2067,41 @@ describe("McpHandler", () => {
     });
   });
 
+  // ---- agent navigation tools ----------------------------------------------
+
+  describe("agent navigation tools", () => {
+    beforeEach(() => {
+      registerTool.mockClear();
+      buildServer(new McpHandler(ops, { ...DEFAULT_SETTINGS, excludedPaths: ["Private/**"] }));
+    });
+
+    test("vault_tree passes path and options through and returns the outline", async () => {
+      const result = await getToolCallback("vault_tree")({ path: "Resources", depth: 3 });
+      expect(ops.vaultTree).toHaveBeenCalledWith("Resources", { depth: 3, maxEntries: undefined, descriptions: undefined });
+      expect(result.content[0].text).toContain("a.md — A");
+    });
+
+    test("vault_tree refuses an excluded folder", async () => {
+      await expect(getToolCallback("vault_tree")({ path: "Private" })).rejects.toThrow(/excluded/i);
+    });
+
+    test("vault_read_many reads each path, reports per-file errors, and truncates", async () => {
+      const result = await getToolCallback("vault_read_many")({
+        paths: ["a.md", "Private/secret.md"],
+        maxCharsPerFile: 200,
+      });
+      const items = JSON.parse(result.content[0].text);
+      expect(items[0].path).toBe("a.md");
+      expect(typeof items[0].content).toBe("string");
+      expect(items[1]).toEqual({ path: "Private/secret.md", error: expect.stringMatching(/excluded/i) });
+    });
+
+    test("vault_neighbors refuses an excluded note", async () => {
+      await expect(getToolCallback("vault_neighbors")({ path: "Private/x.md" })).rejects.toThrow(/excluded/i);
+      expect(ops.noteNeighbors).not.toHaveBeenCalled();
+    });
+  });
+
   // ---- excluded paths --------------------------------------------------------
 
   describe("excluded paths", () => {
@@ -2417,8 +2460,8 @@ describe("McpHandler", () => {
 
       const first = await send(1);
       const second = await send(2);
-      expect(first.body.result.tools).toHaveLength(19);
-      expect(second.body.result.tools).toHaveLength(19);
+      expect(first.body.result.tools).toHaveLength(22);
+      expect(second.body.result.tools).toHaveLength(22);
       expect(first.headers["mcp-session-id"]).toBeUndefined();
       expect(second.headers["mcp-session-id"]).toBeUndefined();
     });
@@ -2580,7 +2623,7 @@ describe("McpHandler", () => {
         .send(sessionlessRequest(1, "tools/list"))
         .expect(200);
 
-      expect(res.body.result.tools).toHaveLength(19);
+      expect(res.body.result.tools).toHaveLength(22);
       expect(res.headers["mcp-session-id"]).toBeUndefined();
     });
 
@@ -2708,7 +2751,7 @@ describe("McpHandler", () => {
         .expect(200);
 
       const message = sseResult(res.text);
-      expect(message.result.tools).toHaveLength(19);
+      expect(message.result.tools).toHaveLength(22);
       const vaultList = (message.result.tools as { name: string; inputSchema: unknown }[]).find(
         (t) => t.name === "vault_list",
       );

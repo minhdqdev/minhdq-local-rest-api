@@ -1,7 +1,7 @@
 {
   "id": "minhdq-local-rest-api",
   "name": "Local REST API with MCP (minhdq)",
-  "version": "5.5.2-minhdq.1",
+  "version": "5.5.2-minhdq.2",
   "minAppVersion": "1.13.1",
   "description": "Minh's fork of Local REST API with MCP: excluded paths hidden from every tool, and Vietnamese-aware ranked search.",
   "author": "minhdqdev",

@@ -647,6 +647,177 @@ export class VaultOperations {
     return null;
   }
 
+  /** A note's one-line summary for navigation: its frontmatter `description`,
+   *  `summary` or `tldr` when it has one, otherwise the first line of prose in its
+   *  body (headings, callout markers, list bullets and links stripped), cut to
+   *  `maxChars`. Empty when the note has neither. */
+  async noteDescription(file: TFile, maxChars = 140): Promise<string> {
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
+    for (const key of ["description", "summary", "tldr"]) {
+      const value = fm[key];
+      if (typeof value === "string" && value.trim()) return clip(value.trim(), maxChars);
+    }
+    const content = await this.app.vault.cachedRead(file);
+    const bodyStart = cache?.frontmatterPosition?.end?.offset ?? frontmatterEnd(content);
+    let inCode = false;
+    for (const raw of content.slice(bodyStart, bodyStart + 20_000).split("\n")) {
+      const line = raw.trim();
+      if (line.startsWith("```")) {
+        inCode = !inCode;
+        continue;
+      }
+      if (inCode || !line || line === "---" || /^#{1,6}\s/.test(line)) continue;
+      if (/^>\s*\[!/.test(line)) continue; // a callout header: its title is a label, not prose
+      const text = line
+        .replace(/^>\s*(\[![^\]]*\][+-]?\s*)?/, "")
+        .replace(/^([-*+]|\d+\.)\s+(\[[ xX]\]\s+)?/, "")
+        .replace(/!?\[\[([^\]|]+)(\|([^\]]+))?\]\]/g, (_m, target: string, _a, alias?: string) => alias ?? target)
+        .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/[*_`~]+/g, "")
+        .trim();
+      if (text.length >= 3) return clip(text, maxChars);
+    }
+    return "";
+  }
+
+  /** A depth-limited outline of a vault folder for an agent to navigate before it
+   *  reads anything: sub-folders with how many notes (and other files) they hold,
+   *  then notes with their one-line {@link noteDescription}. Excluded paths and the
+   *  configuration directory are left out, as everywhere else. Stops after
+   *  `maxEntries` lines and says how many were left out. */
+  async vaultTree(
+    dirPath: string,
+    { depth = 2, maxEntries = 300, descriptions = true }: { depth?: number; maxEntries?: number; descriptions?: boolean } = {},
+  ): Promise<{ tree: string; entries: number; omitted: number }> {
+    this.assertContained(dirPath, "Directory path");
+    const root = dirPath.replace(/^\/+|\/+$/g, "");
+    const prefix = root ? `${root}/` : "";
+    const readable = new Set(this.readableMarkdownFiles().map((f) => f.path));
+    const excluded = excludedPathMatcher(this.settings.excludedPaths);
+    const configDir = this.app.vault.configDir;
+
+    interface Folder {
+      folders: Map<string, Folder>;
+      notes: TFile[];
+      noteCount: number;
+      otherCount: number;
+    }
+    const make = (): Folder => ({ folders: new Map(), notes: [], noteCount: 0, otherCount: 0 });
+    const top = make();
+    for (const file of this.app.vault.getFiles()) {
+      if (!file.path.startsWith(prefix) || excluded(file.path)) continue;
+      if (file.path === configDir || file.path.startsWith(`${configDir}/`)) continue;
+      const isNote = file.extension === "md";
+      if (isNote && !readable.has(file.path)) continue;
+      const parts = file.path.slice(prefix.length).split("/");
+      let node = top;
+      for (const part of parts.slice(0, -1)) {
+        if (isNote) node.noteCount++;
+        else node.otherCount++;
+        let child = node.folders.get(part);
+        if (!child) node.folders.set(part, (child = make()));
+        node = child;
+      }
+      if (isNote) {
+        node.noteCount++;
+        node.notes.push(file);
+      } else node.otherCount++;
+    }
+
+    const lines: string[] = [];
+    let omitted = 0;
+    const header = `${root ? `${root}/` : "/"} (${top.noteCount} notes${top.otherCount ? `, ${top.otherCount} other files` : ""})`;
+    lines.push(header);
+    const walk = async (node: Folder, level: number, indent: string): Promise<void> => {
+      const folders = [...node.folders.entries()].sort(([a], [b]) => a.localeCompare(b));
+      for (const [name, child] of folders) {
+        if (lines.length >= maxEntries) {
+          omitted += 1;
+          continue;
+        }
+        const counts = `${child.noteCount} notes${child.otherCount ? `, ${child.otherCount} other files` : ""}`;
+        lines.push(`${indent}${name}/ (${counts})`);
+        if (level + 1 < depth) await walk(child, level + 1, indent + "  ");
+      }
+      const notes = [...node.notes].sort((a, b) => a.basename.localeCompare(b.basename));
+      for (const note of notes) {
+        if (lines.length >= maxEntries) {
+          omitted += 1;
+          continue;
+        }
+        const description = descriptions ? await this.noteDescription(note) : "";
+        lines.push(`${indent}${note.name}${description ? ` — ${description}` : ""}`);
+      }
+    };
+    await walk(top, 0, "  ");
+    return { tree: lines.join("\n"), entries: lines.length - 1, omitted };
+  }
+
+  /** The notes around one note in the link graph: what it links to and what links
+   *  to it, each with its one-line description, out to `depth` hops (1 or 2).
+   *  Excluded notes never appear, even as a stepping stone to a second hop. */
+  async noteNeighbors(
+    filePath: string,
+    { depth = 1, limit = 50 }: { depth?: number; limit?: number } = {},
+  ): Promise<{
+    path: string;
+    links: Array<{ path: string; description: string }>;
+    backlinks: Array<{ path: string; description: string }>;
+    secondHop?: Array<{ path: string; via: string; description: string }>;
+    omitted: number;
+  }> {
+    this.assertContained(filePath);
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (!(file instanceof TFile)) throw new FileNotFoundError(`File not found: ${filePath}`);
+    const readable = new Map(this.readableMarkdownFiles().map((f) => [f.path, f]));
+    const backlinksIndex = this.getBacklinksIndex();
+    const outOf = (p: string) =>
+      Object.keys(this.app.metadataCache.resolvedLinks[p] ?? {}).filter((t) => t !== p && readable.has(t));
+    const into = (p: string) => (backlinksIndex[p] ?? []).filter((s) => s !== p && readable.has(s));
+
+    let budget = Math.max(1, limit);
+    let omitted = 0;
+    const describe = async (p: string) => {
+      const f = readable.get(p);
+      return f ? this.noteDescription(f) : "";
+    };
+    const take = async (paths: string[]) => {
+      const out: Array<{ path: string; description: string }> = [];
+      for (const p of [...new Set(paths)].sort()) {
+        if (budget <= 0) {
+          omitted++;
+          continue;
+        }
+        budget--;
+        out.push({ path: p, description: await describe(p) });
+      }
+      return out;
+    };
+    const links = await take(outOf(filePath));
+    const backlinks = await take(into(filePath));
+    const result: Awaited<ReturnType<VaultOperations["noteNeighbors"]>> = { path: filePath, links, backlinks, omitted: 0 };
+    if (depth >= 2) {
+      const first = new Set([filePath, ...links.map((l) => l.path), ...backlinks.map((b) => b.path)]);
+      const second = new Map<string, string>();
+      for (const via of first) {
+        if (via === filePath) continue;
+        for (const p of [...outOf(via), ...into(via)]) if (!first.has(p) && !second.has(p)) second.set(p, via);
+      }
+      result.secondHop = [];
+      for (const [p, via] of [...second.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+        if (budget <= 0) {
+          omitted++;
+          continue;
+        }
+        budget--;
+        result.secondHop.push({ path: p, via, description: await describe(p) });
+      }
+    }
+    result.omitted = omitted;
+    return result;
+  }
+
   async listVaultDirectory(dirPath: string): Promise<string[]> {
     this.assertContained(dirPath, "Directory path");
     const normalizedPath = dirPath.endsWith("/")
@@ -1279,4 +1450,21 @@ export class VaultOperations {
       console.error(`[REST API] Failed to open "${filePath}":`, error);
     });
   }
+}
+
+function clip(text: string, maxChars: number): string {
+  const single = text.replace(/\s+/g, " ");
+  if (single.length <= maxChars) return single;
+  const cut = [...single].slice(0, maxChars - 1).join("");
+  return `${cut}…`;
+}
+
+/** Offset just past a leading YAML frontmatter block, or 0. For files the metadata
+ *  cache has not described yet. */
+function frontmatterEnd(content: string): number {
+  if (!content.startsWith("---")) return 0;
+  const end = content.indexOf("\n---", 3);
+  if (end === -1) return 0;
+  const after = content.indexOf("\n", end + 4);
+  return after === -1 ? content.length : after + 1;
 }

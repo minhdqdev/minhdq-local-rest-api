@@ -470,6 +470,16 @@ The exact config syntax varies by client; see the [Quick start](#mcp-clients) ex
 
 `search_simple` returns at most the 20 highest-scoring files and the first 10 matches in each unless the call sets `maxResults` or `maxMatchesPerFile`. Obsidian's simple search matches each word of a query separately, so an unbounded search containing a common word can return megabytes, and an MCP result usually goes straight into the model's context. When anything was left out, a second text block beginning `[Search results limited:` says how much and how to see more. Its `contextLength` is at most 500 characters. `POST /search/simple/` takes the same two parameters but has no limit by default, and does not bound `contextLength`.
 
+### Navigation tools for agents (fork)
+
+Three read-only tools this fork adds so an agent can find its way around a vault without reading it file by file:
+
+- `vault_tree` — a depth-limited outline of a folder: sub-folders with note counts, then notes with a one-line description (frontmatter `description`/`summary`/`tldr`, else the first line of prose).
+- `vault_read_many` — up to 25 notes in one call, each cut to `maxCharsPerFile`, with a per-file `error` instead of failing the batch.
+- `vault_neighbors` — a note's links and backlinks (and, with `depth: 2`, the notes one hop further), each with its description.
+
+All three honour excluded paths and the configuration-directory guard. They are MCP-only; there is no REST route for them.
+
 ### Binary files and attachments
 
 The REST API has always handled binary content: `GET /vault/<path>` returns raw bytes with a `Content-Type` derived from the file extension, and `PUT /vault/<path>` accepts a body of any content type and stores it byte-for-byte. Neither has a practical size limit.

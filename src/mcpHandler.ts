@@ -1277,6 +1277,105 @@ export class McpHandler {
     );
 
     this.tool(
+      "vault_tree",
+      dedent`
+        Outline a vault folder before reading anything: sub-folders with how many notes (and other files) each holds, then notes with a one-line description -- the note's frontmatter description/summary/tldr if it has one, otherwise its first line of prose. Indented two spaces per level, folders first, both alphabetical. Use it to orient yourself and pick notes; then read only those with vault_read_many or vault_read. Excluded paths and the configuration directory never appear. Stops after maxEntries lines and says how many were left out; narrow path or lower depth to see the rest.
+      `,
+      {
+        path: z.string().optional().describe("Folder relative to the vault root (default: the root)"),
+        depth: z
+          .number()
+          .int()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("How many folder levels to expand (default 2). Notes are listed at every expanded level."),
+        maxEntries: z
+          .number()
+          .int()
+          .min(1)
+          .max(2000)
+          .optional()
+          .describe("The most lines to return (default 300)"),
+        descriptions: z
+          .boolean()
+          .optional()
+          .describe("Include each note's one-line description (default true). Turn off for a faster, shorter outline of a large folder."),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({
+        path,
+        depth,
+        maxEntries,
+        descriptions,
+      }: {
+        path?: string;
+        depth?: number;
+        maxEntries?: number;
+        descriptions?: boolean;
+      }) => {
+        const { tree, omitted } = await this.ops.vaultTree(
+          this.vaultPath(path ?? "", "Directory path"),
+          { depth, maxEntries, descriptions },
+        );
+        return this.text(
+          omitted > 0 ? `${tree}\n… ${omitted} more entries not shown; narrow path or lower depth.` : tree,
+        );
+      },
+    );
+
+    this.tool(
+      "vault_read_many",
+      dedent`
+        Read several notes in one call. Returns an array with, for each path in order: path, content (cut to maxCharsPerFile characters, with truncated: true when cut), or error when that one file could not be read -- a missing or excluded file does not fail the others. Prefer this to a string of vault_read calls once vault_tree, search_simple or vault_neighbors has told you which notes you need. It returns content only; use vault_read for one note's frontmatter, links, backlinks and version token.
+      `,
+      {
+        paths: z.array(z.string()).min(1).max(25).describe("Vault-relative paths of the notes to read (at most 25)"),
+        maxCharsPerFile: z
+          .number()
+          .int()
+          .min(200)
+          .max(100_000)
+          .optional()
+          .describe("Characters of each note to return (default 6000)"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ paths, maxCharsPerFile = 6000 }: { paths: string[]; maxCharsPerFile?: number }) => {
+        const out = [];
+        for (const path of paths) {
+          try {
+            const content = await this.readTextStrict(this.vaultPath(path));
+            const chars = [...content];
+            const truncated = chars.length > maxCharsPerFile;
+            out.push({
+              path,
+              content: truncated ? chars.slice(0, maxCharsPerFile).join("") : content,
+              ...(truncated ? { truncated: true, totalChars: chars.length } : {}),
+            });
+          } catch (error) {
+            out.push({ path, error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        return this.text(out);
+      },
+    );
+
+    this.tool(
+      "vault_neighbors",
+      dedent`
+        The notes around one note in the link graph, each with its one-line description: links (notes it links to) and backlinks (notes linking to it); with depth 2, also secondHop -- notes one step further, with the first-hop note they were reached via. Use it to gather related context without reading every note. Excluded notes never appear. Stops after limit notes in all and reports how many were omitted. Link data may be incomplete while Obsidian is still indexing after startup.
+      `,
+      {
+        path: z.string().describe(VAULT_PATH_DESCRIPTION),
+        depth: z.number().int().min(1).max(2).optional().describe("1 (default) or 2 hops"),
+        limit: z.number().int().min(1).max(300).optional().describe("The most notes to return in all (default 50)"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ path, depth, limit }: { path: string; depth?: number; limit?: number }) =>
+        this.text(await this.ops.noteNeighbors(this.vaultPath(path), { depth, limit })),
+    );
+
+    this.tool(
       "vault_read",
       dedent`
         Read a vault file's content and metadata. Returns a JSON object with: content (full markdown text), path, tags (array of tag strings), frontmatter (parsed YAML front-matter as an object), stat ({ctime, mtime, size}), links (array of vault-relative paths this file links to), backlinks (array of vault-relative paths of files that link here), unresolvedLinks (array of link text in this file that does not resolve to an existing vault file), and version (the file's version token -- pass it back as ifMatch to vault_write, vault_append, vault_patch, vault_delete, vault_move or vault_copy so that write fails, rather than overwriting someone else's change, if the file has changed in between). Throws if the file does not exist. The three link fields reflect Obsidian's metadata cache as it stands and may be incomplete while Obsidian is still indexing the vault after startup; the server-status resource (obsidian://local-rest-api/status) reports, under state.metadataCache, when the plugin last heard the cache resolve and when it last heard any indexing activity.
