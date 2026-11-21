@@ -2,8 +2,12 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ApiVersionUnsupportedError = exports.LOCAL_REST_API_PLUGIN_ID = void 0;
 exports.getAPI = getAPI;
-/** The plugin ID the host registers itself under in Obsidian's plugin registry. */
-exports.LOCAL_REST_API_PLUGIN_ID = "obsidian-local-rest-api";
+/** The plugin ID the host registers itself under in Obsidian's plugin registry.
+ *  This fork ships under its own ID so that Obsidian never mistakes it for the
+ *  upstream community plugin and offers to "update" it over the fork. Extensions
+ *  built against upstream's package look up "obsidian-local-rest-api" and will not
+ *  find this host; build them against this repository's publicApi instead. */
+exports.LOCAL_REST_API_PLUGIN_ID = "minhdq-local-rest-api";
 /**
  * Thrown by {@link getAPI} when the caller asks for an extension API version newer
  * than the installed plugin implements.

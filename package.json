@@ -1,6 +1,6 @@
 {
-  "name": "obsidian-local-rest-api",
-  "version": "5.5.2",
+  "name": "minhdq-local-rest-api",
+  "version": "5.5.2-minhdq.1",
   "description": "A secure REST API and Model Context Protocol (MCP) server for Obsidian.",
   "engines": {
     "node": ">=22"
@@ -28,7 +28,7 @@
     "test:integration": "jest --config jest.integration.config.js --runInBand"
   },
   "keywords": [],
-  "author": "",
+  "author": "minhdqdev",
   "license": "MIT",
   "devDependencies": {
     "@eslint/js": "^9.39.4",

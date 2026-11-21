@@ -2437,7 +2437,7 @@ describe("McpHandler", () => {
       expect(res.body.result.capabilities.resources).toBeDefined();
       expect(res.body.result.resultType).toBe("complete");
       expect(res.body.result._meta["io.modelcontextprotocol/serverInfo"]).toEqual({
-        name: "obsidian-local-rest-api",
+        name: "minhdq-local-rest-api",
         version: "1.0.0",
       });
     });
@@ -2647,7 +2647,7 @@ describe("McpHandler", () => {
     test("answers the initialize handshake for sessionful clients", async () => {
       const { result } = await initialize();
       expect(result.protocolVersion).toBe(LEGACY_VERSION);
-      expect(result.serverInfo.name).toBe("obsidian-local-rest-api");
+      expect(result.serverInfo.name).toBe("minhdq-local-rest-api");
       // Sessionful-leg results carry none of the 2026-07-28 wire fields.
       expect(result.resultType).toBeUndefined();
       expect(result.ttlMs).toBeUndefined();
@@ -2666,7 +2666,7 @@ describe("McpHandler", () => {
       // separates the two.
       const { sessionId, result } = await initializeAt(NEWEST_SESSIONFUL_VERSION);
       expect(result.protocolVersion).toBe(NEWEST_SESSIONFUL_VERSION);
-      expect(result.serverInfo.name).toBe("obsidian-local-rest-api");
+      expect(result.serverInfo.name).toBe("minhdq-local-rest-api");
       expect(typeof sessionId).toBe("string");
     });
 

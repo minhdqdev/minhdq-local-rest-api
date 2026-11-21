@@ -29,8 +29,12 @@
 import type { App, Events, PluginManifest, TFile } from "obsidian";
 import type { IRoute, Request, Router } from "express";
 import type { z } from "zod";
-/** The plugin ID the host registers itself under in Obsidian's plugin registry. */
-export declare const LOCAL_REST_API_PLUGIN_ID = "obsidian-local-rest-api";
+/** The plugin ID the host registers itself under in Obsidian's plugin registry.
+ *  This fork ships under its own ID so that Obsidian never mistakes it for the
+ *  upstream community plugin and offers to "update" it over the fork. Extensions
+ *  built against upstream's package look up "obsidian-local-rest-api" and will not
+ *  find this host; build them against this repository's publicApi instead. */
+export declare const LOCAL_REST_API_PLUGIN_ID = "minhdq-local-rest-api";
 /**
  * Behavior hints attached to a registered MCP tool.
  *

@@ -1,4 +1,8 @@
-# Local REST API with MCP
+# Local REST API with MCP (minhdq fork)
+
+> **This is minhdqdev's fork** of [Adam Coddington's Local REST API with MCP](https://github.com/coddingtonbear/obsidian-local-rest-api), based on upstream 5.5.2. It installs under its own plugin ID, `minhdq-local-rest-api`, so Obsidian treats it as a separate plugin and never offers an upstream "update" over it. It adds [excluded paths](#excluded-paths) (files hidden from every REST route and MCP tool) and a [Vietnamese-aware ranked simple search](#searching). Upstream changes are merged by hand.
+>
+> Do not enable it alongside the upstream plugin: both listen on the same ports. Extensions built against upstream's `obsidian-local-rest-api` npm package look the host up by upstream's ID and will not find this one.
 
 Give your scripts, browser extensions, and AI agents a direct line into your Obsidian vault via a secure, authenticated REST API.
 

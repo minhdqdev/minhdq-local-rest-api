@@ -63,7 +63,7 @@ import {
   isCanvasImageScalingAvailable,
 } from "./imageScaling";
 
-const SERVER_INFO = { name: "obsidian-local-rest-api", version: "1.0.0" };
+const SERVER_INFO = { name: "minhdq-local-rest-api", version: "1.0.0" };
 
 // Freshness hints stamped onto every cacheable 2026-07-28 result. The vault is local and
 // changes under the client's feet, so nothing is advertised as `public` — a shared proxy
