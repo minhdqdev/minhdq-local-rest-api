@@ -4,7 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 VERSION="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' manifest.json | head -1)"
-FULL="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+# Resolve the fork from origin's URL, not `gh repo view`: with an "upstream" remote
+# present, gh treats upstream as the default repo and the release would be attempted
+# on coddingtonbear's repository.
+FULL="$(git remote get-url origin | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##')"
+gh repo set-default "$FULL" >/dev/null
 for f in main.js manifest.json styles.css; do test -f ".release/$f" || { echo "missing .release/$f"; exit 1; }; done
 grep -q "\"version\": \"$VERSION\"" .release/manifest.json || { echo ".release/manifest.json is not $VERSION"; exit 1; }
 gh auth setup-git
