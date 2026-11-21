@@ -718,12 +718,25 @@ export class EventStreams {
     listening: Subscription[],
   ): Promise<{ full: Record<string, unknown>; withoutContent: Record<string, unknown> } | null> {
     if (isEventEmitterName(emitter)) {
+      // A file the operator excluded never shows up in a stream: not its contents, and
+      // not its path either -- neither as the file the event is about nor as a
+      // rename's old path. Checked before serializing, since building its NoteJson
+      // would be refused anyway, and again after, for paths a serializer derives
+      // (the file in an active-leaf-change's view).
+      const renamedFrom =
+        emitter === "vault" && event === "rename" && typeof args[1] === "string" ? args[1] : null;
+      const argPaths = [pathOf(args[0]), renamedFrom];
+      if (argPaths.some((p) => p !== null && this.operations.isPathExcluded(p))) return null;
       const includeContent = listening.some((subscription) => subscription.includeContent);
       const serializer = (SERIALIZERS[emitter] as Record<string, Serializer>)[event];
       const serialized = await serializer(
         { note: (file) => this.note(file, includeContent) },
         args,
       );
+      const derived = [serialized.path, serialized.oldPath];
+      if (derived.some((p) => typeof p === "string" && this.operations.isPathExcluded(p))) {
+        return null;
+      }
       const full: StreamedEvent = { emitter, event, ...serialized };
       return { full: { ...full }, withoutContent: { ...stripContent(full) } };
     }

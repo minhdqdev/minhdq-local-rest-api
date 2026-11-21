@@ -91,6 +91,7 @@ import {
 import {
   PathTraversalError,
   ConfigDirAccessError,
+  ExcludedPathError,
   vaultPathIsContained,
   onDiskAccessFor,
   vaultPathIsInConfigDir,
@@ -669,6 +670,14 @@ export default class RequestHandler {
     ) {
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.ConfigDirAccessNotAllowed,
+      });
+      return null;
+    }
+    // Excluded-path guard: the operator's deny-list. VaultOperations enforces it
+    // again before any filesystem access, and hides matches from every listing.
+    if (this.operations.isPathExcluded(segments.join("/"))) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ExcludedPathNotAllowed,
       });
       return null;
     }
@@ -2241,6 +2250,13 @@ export default class RequestHandler {
       return;
     }
 
+    if (this.operations.isPathExcluded(normalized)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ExcludedPathNotAllowed,
+      });
+      return;
+    }
+
     const newPath = !normalized || normalized.endsWith("/")
       ? normalized + sourceFilename
       : normalized;
@@ -2265,6 +2281,10 @@ export default class RequestHandler {
       } else if (error instanceof DestinationAlreadyExistsError) {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.DestinationAlreadyExists,
+        });
+      } else if (error instanceof ExcludedPathError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ExcludedPathNotAllowed,
         });
       } else if (error instanceof ConfigDirAccessError) {
         this.returnCannedResponse(res, {
@@ -2347,6 +2367,13 @@ export default class RequestHandler {
       return;
     }
 
+    if (this.operations.isPathExcluded(normalized)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ExcludedPathNotAllowed,
+      });
+      return;
+    }
+
     const newPath = !normalized || normalized.endsWith("/")
       ? normalized + sourceFilename
       : normalized;
@@ -2371,6 +2398,10 @@ export default class RequestHandler {
       } else if (error instanceof DestinationAlreadyExistsError) {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.DestinationAlreadyExists,
+        });
+      } else if (error instanceof ExcludedPathError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ExcludedPathNotAllowed,
         });
       } else if (error instanceof ConfigDirAccessError) {
         this.returnCannedResponse(res, {
@@ -2429,11 +2460,20 @@ export default class RequestHandler {
     return handler(path, req, res);
   }
 
+  /** The note open in Obsidian, or null when there is none -- or when it is one the
+   *  operator excluded, which `/active/` then treats exactly like no open note, so
+   *  neither its contents nor its path (Content-Location) leaks by being open. */
+  private visibleActiveFile(): TFile | null {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || this.operations.isPathExcluded(file.path)) return null;
+    return file;
+  }
+
   async activeFileGet(
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const file = this.app.workspace.getActiveFile();
+    const file = this.visibleActiveFile();
     if (!file) {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
@@ -2453,7 +2493,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const file = this.app.workspace.getActiveFile();
+    const file = this.visibleActiveFile();
     if (!file) {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
@@ -2505,7 +2545,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const file = this.app.workspace.getActiveFile();
+    const file = this.visibleActiveFile();
     if (!file) {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
@@ -2557,7 +2597,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const file = this.app.workspace.getActiveFile();
+    const file = this.visibleActiveFile();
     if (!file) {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
@@ -2590,7 +2630,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const file = this.app.workspace.getActiveFile();
+    const file = this.visibleActiveFile();
     if (!file) {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
@@ -2815,6 +2855,12 @@ export default class RequestHandler {
     if (err instanceof PathTraversalError) {
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.PathTraversalNotAllowed,
+      });
+      return;
+    }
+    if (err instanceof ExcludedPathError) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ExcludedPathNotAllowed,
       });
       return;
     }
@@ -3124,10 +3170,11 @@ export default class RequestHandler {
       this.vaultSubresources.middleware({
         resolvePathAndTarget: (segments) => this._resolvePathAndTarget(segments),
         getFile: (path) => {
+          if (this.operations.isPathExcluded(path)) return null;
           const file = this.app.vault.getAbstractFileByPath(path);
           return file instanceof TFile ? file : null;
         },
-        getActiveFile: () => this.app.workspace.getActiveFile(),
+        getActiveFile: () => this.visibleActiveFile(),
         isSigned: (req) => this.requestIsSigned(req),
       }),
     );

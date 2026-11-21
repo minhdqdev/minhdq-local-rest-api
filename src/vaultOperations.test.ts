@@ -509,7 +509,9 @@ describe("simpleSearch limits", () => {
     const { results, totalResults } = await ops.simpleSearch("the", { maxResults: 2 });
 
     expect(totalResults).toBe(3);
-    expect(results.map((r) => r.filename)).toEqual(["the the the.md", "the the.md"]);
+    // A file named exactly the query outranks one that merely repeats it; after
+    // that, more occurrences in the name rank higher.
+    expect(results.map((r) => r.filename)).toEqual(["the.md", "the the the.md"]);
   });
 
   test("limits larger than the result leave it whole", async () => {
@@ -578,17 +580,17 @@ describe("simpleSearch surrogate handling", () => {
   });
 
   test("start boundary splits a surrogate pair (issue #330 repro)", async () => {
-    // 🔌 (U+D83D U+DD0C) precedes the match; a contextLength of 2 slices from
-    // code-unit 1, between the two surrogate halves.
-    const { results } = searchSetup("🔌xneedle", 2);
-    expect(await results()).toEqual([{ context: "🔌xneedle" }]);
+    // 🔌 (U+D83D U+DD0C) and a space precede the match at code-unit 3; a
+    // contextLength of 2 slices from code-unit 1, between the two surrogate halves.
+    const { results } = searchSetup("🔌 needle", 2);
+    expect(await results()).toEqual([{ context: "🔌 needle" }]);
   });
 
   test("end boundary splits a surrogate pair", async () => {
-    // The match ends at code-unit 7; a contextLength of 1 slices up to code-unit
+    // The match ends at code-unit 6; a contextLength of 2 slices up to code-unit
     // 8, which sits between the surrogate halves of the trailing 🔌.
-    const { results } = searchSetup("xneedle🔌", 1);
-    expect(await results()).toEqual([{ context: "xneedle🔌" }]);
+    const { results } = searchSetup("needle 🔌", 2);
+    expect(await results()).toEqual([{ context: "needle 🔌" }]);
   });
 });
 

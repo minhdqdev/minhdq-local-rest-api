@@ -29,6 +29,7 @@ export enum ErrorCode {
   ApiKeyAuthorizationRequired = 40101,
   SignedUrlIsWholeFileOnly = 40102,
   ConfigDirAccessNotAllowed = 40321,
+  ExcludedPathNotAllowed = 40322,
   UnknownEvent = 40460,
   EventSubscriptionNotFound = 40461,
   RequestMethodValidOnlyForFiles = 40510,
@@ -106,6 +107,17 @@ export interface LocalRestApiSettings {
    * the risk above.
    */
   enableConfigDirAccess?: boolean;
+
+  /**
+   * Vault-relative globs the API treats as if they were not there: a direct read,
+   * write, move, copy, delete, open or signed URL for a matching path is refused
+   * (403, {@link ErrorCode.ExcludedPathNotAllowed}), and directory listings, both
+   * searches, the tag census, links/backlinks and event streams leave matching files
+   * out. `**` crosses folders, `*` stays within one name; a folder name on its own, or
+   * `folder/**`, covers the folder and everything inside it. Matching folds case and
+   * Unicode normalization the way APFS/NTFS compare names.
+   */
+  excludedPaths?: string[];
 }
 
 declare module "obsidian" {

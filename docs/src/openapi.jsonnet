@@ -726,7 +726,7 @@ std.manifestYamlDoc(
             {
               name: 'query',
               'in': 'query',
-              description: 'Your search query',
+              description: 'Your search query, in any language. Ranked with BM25 over the note\'s name, aliases, headings, tags, frontmatter `description`/`summary` and body, with the name weighted most. Words match whole, case-insensitively and with or without diacritics (\"san pham\" finds \"sản phẩm\"; old and new Vietnamese tone placement, \"hoá\"/\"hóa\", are the same word); exact-accent and whole-phrase matches rank higher, and a note matching only some of the words ranks lower. Files under an excluded path are never returned.',
               required: true,
               schema: {
                 type: 'string',
@@ -755,7 +755,7 @@ std.manifestYamlDoc(
             {
               name: 'maxMatchesPerFile',
               'in': 'query',
-              description: "The most matches to return for each file, in document order. Each file's `totalMatches` gives how many it had in all. Unlimited when absent. Obsidian's simple search matches each word of the query separately, so a query containing a common word can match thousands of times in a single file; this is what keeps such a result a manageable size.",
+              description: "The most matches to return for each file, best first: whole-phrase matches, then words matching with their exact diacritics, then words matching only without them, then document order. Each file's `totalMatches` gives how many it had in all. Unlimited when absent.",
               required: false,
               schema: {
                 type: 'integer',

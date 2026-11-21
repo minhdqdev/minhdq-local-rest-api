@@ -17,6 +17,7 @@ Give your scripts, browser extensions, and AI agents a direct line into your Obs
     + [Other clients](#other-clients)
 - [API overview](#api-overview)
   * [The configuration directory is off-limits](#the-configuration-directory-is-off-limits)
+  * [Excluded paths](#excluded-paths)
   * [Failed authentication is throttled](#failed-authentication-is-throttled)
   * [Conditional writes](#conditional-writes)
   * [Browser clients and response headers](#browser-clients-and-response-headers)
@@ -197,6 +198,16 @@ The check is against where a path lands on disk, not just how it is spelled: a W
 
 If you deliberately manage your Obsidian configuration through the API, turn on **Settings → Local REST API → Advanced settings → Allow access to the configuration directory**. It is off by default, and turning it on grants every holder of your API key that access.
 
+### Excluded paths
+
+**Settings → Local REST API → Excluded paths** takes one vault-relative glob per line (`Private/**`, `**/*.secret.md`, or just a folder name). A matching file is treated as if it were not in the vault, by every REST route and MCP tool:
+
+- a direct read, write, append, patch, move, copy, delete, open or signed URL for it is refused with `403` (error code `40322`) at the REST layer, or a path error from an MCP tool;
+- directory listings, both searches, the tag census, `links`/`backlinks` and event streams leave it out;
+- when it is the note open in Obsidian, `/active/` answers as if no note were open, and `active_file_get_path` refuses.
+
+Paths are resolved before matching (`a/../Private/x.md` is `Private/x.md`) and compared ignoring case and Unicode normalization, as APFS and NTFS do. Changes take effect on the next request. `command_execute` is not path-scoped: a command that itself reveals a note (copying its path, say) is outside this guard.
+
 ### Failed authentication is throttled
 
 A source that presents a wrong credential -- an incorrect API key, or an invalid, expired or spent signed URL -- ten times within a minute has its further wrong credentials refused with `429` (error code `42901`) and a `Retry-After` header until the minute is up. This applies to every route the plugin authenticates, including `/mcp/` and `GET /` (routes an extension plugin publishes without authentication are not behind it): the root route answers `200` with `authenticated: false` to a wrong key, so it would otherwise be the cheapest place to guess from, and a wrong key sent there counts like a wrong key anywhere else.
@@ -337,7 +348,7 @@ curl -k -H "Authorization: Bearer <your-api-key>" \
 
 ## Searching
 
-`POST /search/simple/?query=your+terms` runs Obsidian's built-in fuzzy search and returns matching filenames with scored context snippets. Obsidian matches each word of the query separately, so a query containing a common word can match thousands of times; `&maxResults=` caps how many files come back (keeping the highest-scoring ones) and `&maxMatchesPerFile=` caps the matches within each. Each result's `totalMatches` and the `Total-Results` response header say how much was left out.
+`POST /search/simple/?query=your+terms` runs a ranked full-text search (BM25 over each note's name, aliases, headings, tags, frontmatter `description`/`summary` and body, with the name weighted most) and returns matching filenames with scored context snippets. It is built for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics (`san pham` finds `sản phẩm`), old and new tone placement are the same word (`hoá` = `hóa`), exact-accent and whole-phrase matches rank above loose ones, and a note matching only some of the query's words ranks lower. The index is built in memory when Obsidian starts and brought up to date at the start of every search. `&maxResults=` caps how many files come back (keeping the highest-scoring ones) and `&maxMatchesPerFile=` caps the matches within each, best first. Each result's `totalMatches` and the `Total-Results` response header say how much was left out.
 
 `POST /search/` accepts a [JsonLogic](https://jsonlogic.com/) expression (content type `application/vnd.olrapi.jsonlogic+json`) and evaluates it against each note's metadata (frontmatter, tags, path, content).
 

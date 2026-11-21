@@ -552,3 +552,93 @@ export function assertConfigDirAccessAllowed(
     throw new ConfigDirAccessError(`${label} ${CONFIG_DIR_ACCESS_MESSAGE}.`);
   }
 }
+
+/** Thrown when a client-supplied path matches one of the operator's excluded-path
+ *  patterns. A subclass of {@link ConfigDirAccessError} on purpose: every layer that
+ *  already lets a config-directory refusal through to its error handler (rather than
+ *  swallowing it as a 500 or a "not found") lets this one through too, so a boundary
+ *  that forgets the excluded-path check still cannot read past it. Handlers that know
+ *  about it answer with its own error code. */
+export class ExcludedPathError extends ConfigDirAccessError {}
+
+/** The message every layer refuses an excluded path with. */
+export const EXCLUDED_PATH_MESSAGE =
+  "is excluded from this API by the vault owner (Settings → Local REST API → Excluded paths)";
+
+/** The canonical, vault-relative form a path is matched against excluded-path patterns
+ *  in: resolved the way {@link vaultPathIsContained} resolves it (so "a/./b" and
+ *  "a/x/../b" are "a/b"), then NFC- and case-folded per segment the way APFS and NTFS
+ *  compare names (so "resources/PRIVATE/x.md" is "Resources/Private/x.md" there). The
+ *  vault root is "". Only meaningful for a contained path. */
+function canonicalVaultPath(candidate: string): string {
+  const resolved = posix.resolve(SYNTHETIC_ROOT, foldForResolution(candidate));
+  if (resolved === SYNTHETIC_ROOT) return "";
+  return canonicalNameForm(resolved.slice(SYNTHETIC_ROOT.length + 1));
+}
+
+/** One excluded-path glob, compiled. `**` crosses folders, `*` and `?` stay within one
+ *  name. A pattern ending in `/**` also matches the folder itself, so excluding
+ *  "Private/**" hides "Private" from a directory listing and refuses "Private/" as a
+ *  write destination, not only the files inside it. */
+function compileExcludedPattern(pattern: string): RegExp | null {
+  const trimmed = pattern.trim().replace(/^\/+/, "");
+  if (!trimmed) return null;
+  const canonical = canonicalNameForm(trimmed.replace(/\\/g, "/"));
+  let re = "";
+  for (let i = 0; i < canonical.length; i++) {
+    const c = canonical[i];
+    if (c === "*" && canonical[i + 1] === "*") {
+      if (canonical[i + 2] === "/") {
+        re += "(?:.*/)?";
+        i += 2;
+      } else if (i + 2 === canonical.length && re.endsWith("/")) {
+        // "folder/**": the folder itself or anything beneath it.
+        re = `${re.slice(0, -1)}(?:/.*)?`;
+        i += 1;
+      } else {
+        re += ".*";
+        i += 1;
+      }
+    } else if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  // A bare folder name ("Private" or "Private/") means the folder and its contents.
+  if (!/[*?]/.test(canonical)) re = `${re.replace(/\/$/, "")}(?:/.*)?`;
+  return new RegExp(`^${re}$`, "u");
+}
+
+const excludedMatcherCache = new Map<string, (candidate: string) => boolean>();
+
+/** A predicate telling whether a vault-relative path is excluded by `patterns`.
+ *  Compiled once per distinct pattern list. An empty or absent list excludes nothing. */
+export function excludedPathMatcher(
+  patterns: readonly string[] | undefined,
+): (candidate: string) => boolean {
+  const list = (patterns ?? []).map((p) => p.trim()).filter(Boolean);
+  if (list.length === 0) return () => false;
+  const key = JSON.stringify(list);
+  let matcher = excludedMatcherCache.get(key);
+  if (!matcher) {
+    const regexps = list.map(compileExcludedPattern).filter((r): r is RegExp => r !== null);
+    matcher = (candidate: string) => {
+      if (!vaultPathIsContained(candidate)) return false;
+      const canonical = canonicalVaultPath(candidate);
+      return canonical !== "" && regexps.some((re) => re.test(canonical));
+    };
+    if (excludedMatcherCache.size > 32) excludedMatcherCache.clear();
+    excludedMatcherCache.set(key, matcher);
+  }
+  return matcher;
+}
+
+/** Throw {@link ExcludedPathError} when `candidate` matches an excluded-path pattern. */
+export function assertNotExcluded(
+  candidate: string,
+  patterns: readonly string[] | undefined,
+  label = "Path",
+): void {
+  if (excludedPathMatcher(patterns)(candidate)) {
+    throw new ExcludedPathError(`${label} ${EXCLUDED_PATH_MESSAGE}.`);
+  }
+}

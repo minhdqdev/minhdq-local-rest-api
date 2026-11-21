@@ -101,6 +101,8 @@ export const ERROR_CODE_MESSAGES: Record<ErrorCode, string> = {
     "Path traversal is not allowed. Paths must be relative, within the vault, and free of ':' and control characters.",
   [ErrorCode.ConfigDirAccessNotAllowed]:
     "Access to the Obsidian configuration directory is not allowed. Enable 'Allow access to the configuration directory' under Settings → Local REST API → Advanced settings to permit it.",
+  [ErrorCode.ExcludedPathNotAllowed]:
+    "This path is excluded from the API by the vault owner. Matching files are hidden from every tool; change the list under Settings → Local REST API → Excluded paths.",
   [ErrorCode.DestinationAlreadyExists]:
     "Destination file already exists.",
   [ErrorCode.FileOperationFailed]:

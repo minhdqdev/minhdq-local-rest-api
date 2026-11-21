@@ -2059,6 +2059,56 @@ describe("McpHandler", () => {
     });
   });
 
+  // ---- excluded paths --------------------------------------------------------
+
+  describe("excluded paths", () => {
+    const settings = { ...DEFAULT_SETTINGS, excludedPaths: ["Resources/Private/**"] };
+
+    beforeEach(() => {
+      registerTool.mockClear();
+      buildServer(new McpHandler(ops, settings));
+    });
+
+    test.each([
+      "Resources/Private/id.md",
+      "resources/PRIVATE/id.md",
+      "Resources/Public/../Private/id.md",
+      "Resources/Private",
+    ])("vault_write refuses %s", async (path) => {
+      await expect(getToolCallback("vault_write")({ path, content: "x" })).rejects.toThrow(
+        /excluded/i,
+      );
+      expect(ops.writeFileContent).not.toHaveBeenCalled();
+    });
+
+    test("vault_read refuses an excluded note", async () => {
+      await expect(
+        getToolCallback("vault_read")({ path: "Resources/Private/id.md" }),
+      ).rejects.toThrow(/excluded/i);
+    });
+
+    test("vault_move refuses an excluded destination", async () => {
+      await expect(
+        getToolCallback("vault_move")({
+          path: "notes/a.md",
+          destination: "Resources/Private/a.md",
+        }),
+      ).rejects.toThrow(/excluded/i);
+    });
+
+    test("open_file refuses an excluded note", async () => {
+      await expect(
+        getToolCallback("open_file")({ path: "Resources/Private/id.md" }),
+      ).rejects.toThrow(/excluded/i);
+      expect(ops.openVaultFile).not.toHaveBeenCalled();
+    });
+
+    test("a sibling folder sharing the prefix is allowed", async () => {
+      await getToolCallback("vault_write")({ path: "Resources/PrivateNotes.md", content: "x" });
+      expect(ops.writeFileContent).toHaveBeenCalled();
+    });
+  });
+
   // ---- configuration directory access -------------------------------------
 
   describe("configuration directory access (GHSA-66m9-r757-qvq7)", () => {

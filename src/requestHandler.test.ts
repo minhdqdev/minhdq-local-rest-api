@@ -3137,6 +3137,71 @@ describe("requestHandler", () => {
     });
   });
 
+  describe("excluded paths", () => {
+    beforeEach(() => {
+      settings.excludedPaths = ["Resources/Private/**"];
+    });
+
+    test.each([
+      ["GET", "/vault/Resources/Private/id.md"],
+      ["GET", "/vault/resources/PRIVATE/id.md"],
+      ["GET", "/vault/Resources/Private/"],
+      ["DELETE", "/vault/Resources/Private/id.md"],
+    ])("%s %s is refused with 403 and errorCode 40322", async (method, path) => {
+      const res = await (method === "GET"
+        ? request(server).get(path)
+        : request(server).delete(path)
+      ).set("Authorization", `Bearer ${API_KEY}`);
+      expect(res.status).toBe(403);
+      expect(res.body.errorCode).toBe(40322);
+    });
+
+    test("PUT into an excluded folder is refused", async () => {
+      const res = await request(server)
+        .put("/vault/Resources/Private/new.md")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .set("Content-Type", "text/markdown")
+        .send("x");
+      expect(res.status).toBe(403);
+      expect(res.body.errorCode).toBe(40322);
+    });
+
+    test("MOVE into an excluded folder is refused", async () => {
+      const res = await request(server)
+        .move("/vault/notes/a.md")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .set("Destination", "Resources/Private/a.md");
+      expect(res.status).toBe(403);
+      expect(res.body.errorCode).toBe(40322);
+    });
+
+    test("an excluded active note reads as no active note, without leaking its path", async () => {
+      const active = Object.assign(new TFile(), { path: "Resources/Private/id.md" });
+      jest.spyOn(app.workspace, "getActiveFile").mockReturnValue(active);
+      const res = await request(server)
+        .get("/active/")
+        .set("Authorization", `Bearer ${API_KEY}`);
+      expect(res.status).toBe(404);
+      expect(res.headers["content-location"]).toBeUndefined();
+      jest.restoreAllMocks();
+    });
+
+    test("simple search leaves excluded notes out", async () => {
+      const pub = Object.assign(new TFile(), { path: "Resources/plan.md", basename: "plan" });
+      const priv = Object.assign(new TFile(), {
+        path: "Resources/Private/plan.md",
+        basename: "plan",
+      });
+      app.vault._markdownFiles = [pub, priv];
+      app.vault._cachedRead = "secret plan";
+      const res = await request(server)
+        .post("/search/simple/?query=plan")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+      expect(res.body.map((r: { filename: string }) => r.filename)).toEqual(["Resources/plan.md"]);
+    });
+  });
+
   describe("configuration directory access (GHSA-66m9-r757-qvq7)", () => {
     // Writing a plugin here and enabling it is arbitrary code execution; reading
     // here leaks the API key out of this plugin's own data.json. Blocked for both
@@ -4420,7 +4485,7 @@ describe("requestHandler", () => {
       testFile.basename = "Note";
       testFile.path = "Note.md";
 
-      const longContent = "A".repeat(200) + "MATCH" + "B".repeat(200);
+      const longContent = "A".repeat(200) + " MATCH " + "B".repeat(200);
       app.vault._markdownFiles = [testFile];
       app.vault._cachedRead = longContent;
 
@@ -4482,91 +4547,20 @@ describe("requestHandler", () => {
       expect(result.body[0].matches[1].match.end).toBe(6);
     });
 
-    test("boundary-spanning matches are filtered out", async () => {
-      // This test verifies that matches spanning from filename into content are skipped.
-      // When searching for a term that bridges the filename and content (e.g., "Master\n\nThe"),
-      // such matches would produce invalid results (negative start positions).
+    test("a word inside a longer word is not a match", async () => {
       const testFile = new TFile();
-      testFile.basename = "Master";
-      testFile.path = "Master.md";
+      testFile.basename = "Masterclass";
+      testFile.path = "Masterclass.md";
 
       app.vault._markdownFiles = [testFile];
-      app.vault._cachedRead = "The content starts here";
-
-      // Mock prepareSimpleSearch to return a boundary-spanning match
-      _prepareSimpleSearchMock.behavior = (query: string) => {
-        return (text: string) => {
-          // Simulate a match that spans from filename into content
-          // filename "Master" + "\n\n" = 8 chars (positionOffset)
-          // A boundary-spanning match would have start < 8 and end > 8
-          const matches: [number, number][] = [
-            [0, 11], // Spans from "Master" (0) into content "The" (ends at 11)
-          ];
-          return {
-            score: 1,
-            matches,
-          };
-        };
-      };
+      app.vault._cachedRead = "Remastered edition";
 
       const result = await request(server)
-        .post("/search/simple/?query=Master%0A%0AThe")
+        .post("/search/simple/?query=master")
         .set("Authorization", `Bearer ${API_KEY}`)
         .expect(200);
 
-      // The file should still be in results (because there was a match)
-      expect(result.body).toHaveLength(1);
-      // But the boundary-spanning match should be filtered out
-      expect(result.body[0].matches).toHaveLength(0);
-    });
-
-    test("boundary-spanning matches don't affect valid matches", async () => {
-      // Verify that when there are both boundary-spanning and valid matches,
-      // only the valid ones are returned
-      const testFile = new TFile();
-      testFile.basename = "Master";
-      testFile.path = "Master.md";
-
-      app.vault._markdownFiles = [testFile];
-      app.vault._cachedRead = "The Master plan content";
-
-      // Mock prepareSimpleSearch to return both valid and boundary-spanning matches
-      _prepareSimpleSearchMock.behavior = (query: string) => {
-        return (text: string) => {
-          // text = "Master\n\n" + "The Master plan content"
-          // positionOffset = 8
-          const matches: [number, number][] = [
-            [0, 11],  // Boundary-spanning: starts in filename, ends in content (should be filtered)
-            [0, 6],   // Valid: entirely in filename "Master" (should be kept)
-            [12, 18], // Valid: "Master" in content at position 4, adjusted = 12-8=4, 18-8=10 (should be kept)
-          ];
-          return {
-            score: 3,
-            matches,
-          };
-        };
-      };
-
-      const result = await request(server)
-        .post("/search/simple/?query=Master")
-        .set("Authorization", `Bearer ${API_KEY}`)
-        .expect(200);
-
-      expect(result.body).toHaveLength(1);
-      // Only 2 valid matches should be returned (boundary-spanning filtered out)
-      expect(result.body[0].matches).toHaveLength(2);
-      // ...and the one that was filtered out is not counted as left out either.
-      expect(result.body[0].totalMatches).toBe(2);
-
-      // First match: filename
-      expect(result.body[0].matches[0].match.source).toBe("filename");
-      expect(result.body[0].matches[0].match.start).toBe(0);
-      expect(result.body[0].matches[0].match.end).toBe(6);
-
-      // Second match: content (position adjusted by positionOffset)
-      expect(result.body[0].matches[1].match.source).toBe("content");
-      expect(result.body[0].matches[1].match.start).toBe(4);  // 12 - 8
-      expect(result.body[0].matches[1].match.end).toBe(10);   // 18 - 8
+      expect(result.body).toHaveLength(0);
     });
 
     describe("limits", () => {
@@ -4582,6 +4576,9 @@ describe("requestHandler", () => {
         app.vault._cachedRead = "plan b, plan c";
       });
 
+      type Hit = { filename: string; matches: unknown[]; totalMatches: number };
+      const byName = (body: Hit[], name: string) => body.find((r) => r.filename === name);
+
       test("returns everything when no limit is given, with the file count in Total-Results", async () => {
         const result = await request(server)
           .post("/search/simple/?query=plan")
@@ -4590,8 +4587,9 @@ describe("requestHandler", () => {
 
         expect(result.headers["total-results"]).toBe("3");
         expect(result.body).toHaveLength(3);
-        expect(result.body[0].matches).toHaveLength(5);
-        expect(result.body[0].totalMatches).toBe(5);
+        // Three in the name, two in the shared content.
+        expect(byName(result.body, "plan plan plan.md").matches).toHaveLength(5);
+        expect(byName(result.body, "plan plan plan.md").totalMatches).toBe(5);
       });
 
       test("maxResults keeps the highest-scoring files", async () => {
@@ -4601,23 +4599,24 @@ describe("requestHandler", () => {
           .expect(200);
 
         expect(result.headers["total-results"]).toBe("3");
+        // A file named exactly the query ranks first; then more occurrences win.
         expect(result.body.map((r: { filename: string }) => r.filename)).toEqual([
+          "plan.md",
           "plan plan plan.md",
-          "plan plan.md",
         ]);
       });
 
-      test("maxMatchesPerFile keeps the first matches and reports the total", async () => {
+      test("maxMatchesPerFile keeps the best matches and reports the total", async () => {
         const result = await request(server)
           .post("/search/simple/?query=plan&maxMatchesPerFile=2")
           .set("Authorization", `Bearer ${API_KEY}`)
           .expect(200);
 
         expect(result.body).toHaveLength(3);
-        expect(result.body[0].matches).toHaveLength(2);
-        expect(result.body[0].totalMatches).toBe(5);
-        expect(result.body[2].matches).toHaveLength(2);
-        expect(result.body[2].totalMatches).toBe(3);
+        expect(byName(result.body, "plan plan plan.md").matches).toHaveLength(2);
+        expect(byName(result.body, "plan plan plan.md").totalMatches).toBe(5);
+        expect(byName(result.body, "plan.md").matches).toHaveLength(2);
+        expect(byName(result.body, "plan.md").totalMatches).toBe(3);
       });
 
       test.each([

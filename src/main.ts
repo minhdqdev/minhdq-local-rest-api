@@ -748,6 +748,24 @@ class LocalRestApiSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: "Excluded paths",
+            desc: "One vault-relative glob per line. Matching files are invisible to every REST route and MCP tool: direct reads, writes, moves, copies, deletes, opens and signed URLs are refused, and directory listings, searches, tags, links/backlinks and event streams leave them out. A folder name on its own, or folder/**, covers the folder and everything in it; ** crosses folders and * stays within one name. Case and Unicode normalization are ignored, as on macOS. Takes effect immediately.",
+            render: (setting) => {
+              setting.settingEl.addClass("obsidian-local-rest-api-excluded-paths");
+              setting.addTextArea((area) => {
+                area.inputEl.rows = 5;
+                area.inputEl.addClass("obsidian-local-rest-api-excluded-paths-input");
+                area.setPlaceholder("Private/**\n**/*.secret.md");
+                area.setValue((this.plugin.settings.excludedPaths ?? []).join("\n"));
+                area.onChange(async (value) => {
+                  const patterns = value.split("\n").map((line) => line.trim()).filter(Boolean);
+                  this.plugin.settings.excludedPaths = patterns.length ? patterns : undefined;
+                  await this.plugin.saveSettings();
+                });
+              });
+            },
+          },
+          {
             type: "page",
             name: "Advanced settings",
             desc: "Advanced settings are dangerous and may make your environment less secure.",

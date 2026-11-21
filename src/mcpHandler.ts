@@ -33,6 +33,7 @@ import { MaximumMcpBinaryBytes } from "./constants";
 import {
   assertVaultPathIsContained,
   assertConfigDirAccessAllowed,
+  assertNotExcluded,
   onDiskAccessFor,
 } from "./vaultPath";
 import { LocalRestApiSettings } from "./types";
@@ -510,6 +511,7 @@ export class McpHandler {
       "Path",
       onDiskAccessFor(this.ops.app.vault.adapter),
     );
+    assertNotExcluded(normalized, this.settings.excludedPaths, "Path");
     return normalized;
   }
 
@@ -794,6 +796,7 @@ export class McpHandler {
       label,
       onDiskAccessFor(this.ops.app.vault.adapter),
     );
+    assertNotExcluded(candidate, this.settings.excludedPaths, label);
     return candidate;
   }
 
@@ -1086,6 +1089,9 @@ export class McpHandler {
   private getActiveFile(): TFile {
     const file = this.ops.app.workspace.getActiveFile();
     if (!file) throw new Error("No active file");
+    // The open note's path comes from the workspace, not the client, so it never
+    // passed through vaultPath(); an excluded note must not leak by being open.
+    assertNotExcluded(file.path, this.settings.excludedPaths, "The active file");
     return file;
   }
 
@@ -1805,7 +1811,7 @@ export class McpHandler {
 
     this.tool(
       "search_simple",
-      dedent`Search vault files using Obsidian's built-in simple search. Returns an array of {filename, score, matches, totalMatches} objects sorted by relevance score. Each match includes the matched text and surrounding context characters (controlled by contextLength). Obsidian matches each word of the query separately, so common words match nearly everywhere; prefer distinctive terms. Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the first ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
+      dedent`Ranked full-text search over the vault (BM25 over note name, aliases, headings, tags, frontmatter description/summary and body; the note name weighs most). Works for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics ("san pham" finds "sản phẩm"), old and new tone placement are the same word ("hoá" = "hóa"), and exact-accent and whole-phrase matches rank above loose ones; a note matching only some of the query's words ranks lower. Returns an array of {filename, score, matches, totalMatches} objects sorted by score, highest first. Each match includes the matched text and surrounding context characters (controlled by contextLength); a file's matches come best first (whole phrases, then exact-accent words, then the rest). Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the best ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
       {
         query: z.string().describe("Search query string"),
         contextLength: z
@@ -1826,7 +1832,7 @@ export class McpHandler {
           .int()
           .positive()
           .optional()
-          .describe(`The most matches to return for each file, in document order (default: ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE})`),
+          .describe(`The most matches to return for each file, best first (default: ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE})`),
       },
       READ_ONLY_ANNOTATIONS,
       async ({

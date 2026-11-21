@@ -5,9 +5,10 @@ import {
   Command,
   Component,
   MarkdownRenderer,
-  prepareSimpleSearch,
   TFile,
 } from "obsidian";
+import { VaultSearch } from "./fts/vaultSearch";
+import { findMatches } from "./fts/matches";
 import path from "path";
 import {
   applyPatch,
@@ -58,7 +59,9 @@ import {
 import {
   assertVaultPathIsContained,
   assertConfigDirAccessAllowed,
+  assertNotExcluded,
   configDirMatcher,
+  excludedPathMatcher,
   onDiskAccessFor,
   ConfigDirAccessError,
   PathTraversalError,
@@ -134,7 +137,18 @@ export class VaultOperations {
     this.cachedBacklinksIndex = null;
   };
 
+  /** The ranked, Vietnamese-aware full-text index behind {@link simpleSearch}. */
+  private readonly vaultSearch: VaultSearch;
+
   constructor(readonly app: App, readonly settings: LocalRestApiSettings) {
+    this.vaultSearch = new VaultSearch(app, {
+      readableFiles: () => this.readableMarkdownFiles(),
+      key: () =>
+        JSON.stringify([this.settings.excludedPaths ?? [], this.settings.enableConfigDirAccess ?? false]),
+    });
+    // Warm the index once Obsidian has finished indexing the vault itself, so the
+    // first search does not pay for the build.
+    this.app.workspace?.onLayoutReady?.(() => this.vaultSearch.warm());
     for (const event of METADATA_CACHE_EVENTS) {
       this.app.metadataCache.on(
         event as "resolved",
@@ -173,6 +187,7 @@ export class VaultOperations {
    * goes on invalidating a cache nobody will read again.
    */
   dispose(): void {
+    this.vaultSearch.detach();
     for (const event of METADATA_CACHE_EVENTS) {
       this.app.metadataCache.off(event, this.invalidateBacklinksIndex);
     }
@@ -205,6 +220,14 @@ export class VaultOperations {
       label,
       onDiskAccessFor(this.app.vault.adapter),
     );
+    assertNotExcluded(filePath, this.settings.excludedPaths, label);
+  }
+
+  /** Whether the operator has excluded `filePath` from the API (see
+   *  `LocalRestApiSettings.excludedPaths`). Used by everything that enumerates
+   *  paths -- listings, searches, links, events -- to leave such files out. */
+  isPathExcluded(filePath: string): boolean {
+    return excludedPathMatcher(this.settings.excludedPaths)(filePath);
   }
 
   /** The indexed markdown files a bulk read -- a search, the tag census -- may
@@ -216,7 +239,8 @@ export class VaultOperations {
    *  matcher is built once per call so the whole index costs one on-disk lookup
    *  per directory, not per file. */
   private readableMarkdownFiles(): TFile[] {
-    const files = this.app.vault.getMarkdownFiles();
+    const excluded = excludedPathMatcher(this.settings.excludedPaths);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => !excluded(file.path));
     if (this.settings.enableConfigDirAccess) return files;
     const inConfigDir = configDirMatcher(
       this.app.vault.configDir,
@@ -434,10 +458,13 @@ export class VaultOperations {
 
   buildBacklinksIndex(): Record<string, string[]> {
     const index: Record<string, string[]> = {};
+    const excluded = excludedPathMatcher(this.settings.excludedPaths);
     for (const [sourcePath, targets] of Object.entries(
       this.app.metadataCache.resolvedLinks,
     )) {
+      if (excluded(sourcePath)) continue;
       for (const targetPath of Object.keys(targets)) {
+        if (excluded(targetPath)) continue;
         (index[targetPath] ??= []).push(sourcePath);
       }
     }
@@ -492,7 +519,7 @@ export class VaultOperations {
 
     const links = Object.keys(
       this.app.metadataCache.resolvedLinks[file.path] ?? {},
-    );
+    ).filter((target) => !this.isPathExcluded(target));
     const unresolvedLinks = Object.keys(
       this.app.metadataCache.unresolvedLinks[file.path] ?? {},
     );
@@ -501,7 +528,7 @@ export class VaultOperations {
     // Copied rather than handed out: the cached index outlives the response
     // built from it, so one caller mutating what it was given would otherwise
     // reach every caller after it.
-    const backlinks = [...(index[file.path] ?? [])];
+    const backlinks = (index[file.path] ?? []).filter((source) => !this.isPathExcluded(source));
 
     return {
       tags: filteredTags,
@@ -632,6 +659,7 @@ export class VaultOperations {
           .getFiles()
           .map((e) => e.path)
           .filter((filename) => filename.startsWith(prefix))
+          .filter((filename) => !this.isPathExcluded(filename))
           .map((filename) => {
             const subPath = filename.slice(prefix.length);
             if (subPath.indexOf("/") > -1) {
@@ -1050,6 +1078,14 @@ export class VaultOperations {
     });
   }
 
+  /**
+   * Ranked full-text search (BM25F over title, aliases, headings, tags, frontmatter
+   * description and body), tuned for Vietnamese: a word matches with or without its
+   * diacritics, old and new tone placement ("hoá"/"hóa") are the same word, an exact
+   * accent and a whole-phrase match outrank loose ones, and a note matching only some
+   * of the query's words is penalised. Each file's `matches` are best first: whole
+   * phrases, then exact-accent words, then folded ones, then document order.
+   */
   async simpleSearch(
     query: string,
     {
@@ -1058,65 +1094,52 @@ export class VaultOperations {
       maxMatchesPerFile = Infinity,
     }: SimpleSearchOptions = {},
   ): Promise<SimpleSearchResult> {
+    const { total, hits } = await this.vaultSearch.search(query, {
+      limit: Number.isFinite(maxResults) ? maxResults : undefined,
+    });
     const results: SearchResponseItem[] = [];
-    const search = prepareSimpleSearch(query);
+    const readable = new Map(this.readableMarkdownFiles().map((file) => [file.path, file]));
 
-    for (const file of this.readableMarkdownFiles()) {
-      const cachedContents = await this.app.vault.cachedRead(file);
+    for (const hit of hits) {
+      const file = readable.get(hit.path);
+      const content = file instanceof TFile ? await this.app.vault.cachedRead(file) : "";
+      const basename = file instanceof TFile ? file.basename : hit.title;
 
-      const filenamePrefix = file.basename + "\n\n";
-      const result = search(filenamePrefix + cachedContents);
-      const positionOffset = filenamePrefix.length;
+      const contextMatches: SearchContext[] = [];
+      const titleSpans = findMatches(basename, query);
+      const contentSpans = findMatches(content, query);
+      const totalMatches = titleSpans.length + contentSpans.length;
 
-      if (result) {
-        const contextMatches: SearchContext[] = [];
-        let totalMatches = 0;
-        for (const match of result.matches) {
-          const inFilename = match[0] < positionOffset && match[1] <= positionOffset;
-          const inContent = match[0] >= positionOffset;
-          if (!inFilename && !inContent) continue;
-          totalMatches += 1;
-          // Matches past the cap are still counted, so the caller can say how many
-          // were left out, but their context is never sliced.
-          if (contextMatches.length >= maxMatchesPerFile) continue;
-          if (inFilename) {
-            contextMatches.push({
-              match: {
-                start: match[0],
-                end: Math.min(match[1], file.basename.length),
-                source: "filename",
-              },
-              context: file.basename,
-            });
-          } else {
-            contextMatches.push({
-              match: {
-                start: match[0] - positionOffset,
-                end: match[1] - positionOffset,
-                source: "content",
-              },
-              context: cachedContents.slice(
-                ...this.widenToCodePointBoundaries(
-                  cachedContents,
-                  Math.max(match[0] - positionOffset - contextLength, 0),
-                  match[1] - positionOffset + contextLength,
-                ),
-              ),
-            });
-          }
-        }
-
-        results.push({
-          filename: file.path,
-          score: result.score,
-          matches: contextMatches,
-          totalMatches,
+      for (const span of titleSpans) {
+        if (contextMatches.length >= maxMatchesPerFile) break;
+        contextMatches.push({
+          match: { start: span.start, end: span.end, source: "filename" },
+          context: basename,
         });
       }
+      for (const span of contentSpans) {
+        if (contextMatches.length >= maxMatchesPerFile) break;
+        contextMatches.push({
+          match: { start: span.start, end: span.end, source: "content" },
+          context: content.slice(
+            ...this.widenToCodePointBoundaries(
+              content,
+              Math.max(span.start - contextLength, 0),
+              span.end + contextLength,
+            ),
+          ),
+        });
+      }
+
+      results.push({
+        filename: hit.path,
+        score: hit.score,
+        matches: contextMatches,
+        totalMatches,
+      });
     }
 
-    results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-    return { results: results.slice(0, maxResults), totalResults: results.length };
+    return { results, totalResults: total };
   }
 
   async searchJsonLogic(
