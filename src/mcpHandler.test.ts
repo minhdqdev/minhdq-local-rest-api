@@ -307,8 +307,8 @@ describe("McpHandler", () => {
 
   // ---- tool registration --------------------------------------------------
 
-  test("registers all 26 tools (the two signed-URL tools are there because that setting is on by default)", () => {
-    expect(registerTool).toHaveBeenCalledTimes(26);
+  test("registers all 29 tools (the two signed-URL tools are there because that setting is on by default)", () => {
+    expect(registerTool).toHaveBeenCalledTimes(29);
     const names = registerTool.mock.calls.map((c: unknown[]) => c[0]);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -322,6 +322,9 @@ describe("McpHandler", () => {
         "recent_changes",
         "frontmatter_update_many",
         "tag_rename",
+        "note_find",
+        "search_related",
+        "vault_batch",
         "vault_read",
         "vault_read_binary",
         "vault_write",
@@ -359,6 +362,8 @@ describe("McpHandler", () => {
         "active_file_get_path",
         "search_query",
         "search_simple",
+        "note_find",
+        "search_related",
         "tag_list",
         "command_list",
       ]) {
@@ -731,6 +736,47 @@ describe("McpHandler", () => {
     expect(parseText(result).message).toBe("OK");
   });
 
+  test("vault_write serialises a frontmatter object as YAML before the body", async () => {
+    await getToolCallback("vault_write")({
+      path: "n.md",
+      content: "Body text",
+      frontmatter: { description: 'Say "hi": it\'s fine', tags: ["ai", "rag"] },
+      ifNoneMatch: "*",
+    });
+    const [, written] = ops.writeFileContent.mock.calls.at(-1);
+    expect(written).toBe('---\ndescription: "Say \\"hi\\": it\'s fine"\ntags:\n  - ai\n  - rag\n---\n\nBody text');
+    await expect(
+      getToolCallback("vault_write")({ path: "n.md", content: "---\na: 1\n---\n", frontmatter: { b: 2 } }),
+    ).rejects.toThrow(/not both/);
+  });
+
+  test("vault_batch runs operations in order and stops at the first failure", async () => {
+    ops.writeFileContent.mockResolvedValueOnce("v1");
+    ops.patchFileSectionMdp2.mockRejectedValueOnce(new Error("target not found"));
+    const result = await getToolCallback("vault_batch")({
+      operations: [
+        { op: "write", path: "src.md", content: "body", frontmatter: { description: "d" }, ifNoneMatch: "*" },
+        { op: "patch", path: "rel.md", instruction: { targetType: "heading", target: ["Related sources"], operation: "append", content: "- [[src]]" } },
+        { op: "append", path: "log.md", content: "- line" },
+      ],
+    });
+    const body = parseText(result);
+    expect(body).toMatchObject({ ok: 1, failed: 1, skipped: 1 });
+    expect(body.results.map((r: { status: string }) => r.status)).toEqual(["ok", "error", "skipped"]);
+    expect(body.results[1].error).toMatch(/target not found/);
+    expect(ops.appendFileContent).not.toHaveBeenCalledWith("log.md", expect.anything(), expect.anything());
+  });
+
+  test("tag_list filters by prefix, query and minCount and sorts by count", async () => {
+    ops.getAllTags.mockReturnValueOnce([
+      { name: "ai", count: 27 }, { name: "ai/rag", count: 3 }, { name: "aws", count: 103 }, { name: "Kỹ-năng", count: 1 },
+    ]);
+    const body = parseText(await getToolCallback("tag_list")({ prefix: "ai", minCount: 2 }));
+    expect(body).toEqual({ tags: [{ name: "ai", count: 27 }, { name: "ai/rag", count: 3 }], matched: 2, totalTags: 4 });
+    ops.getAllTags.mockReturnValueOnce([{ name: "Kỹ-năng", count: 1 }, { name: "aws", count: 9 }]);
+    expect(parseText(await getToolCallback("tag_list")({ query: "ky nang".replace(" ", "-") })).tags).toEqual([{ name: "Kỹ-năng", count: 1 }]);
+  });
+
   // ---- conditional writes --------------------------------------------------
 
   describe("conditional writes", () => {
@@ -899,12 +945,12 @@ describe("McpHandler", () => {
       build(UNSIGNED);
       expect(registeredNames()).not.toContain("vault_get_download_url");
       expect(registeredNames()).not.toContain("vault_get_upload_url");
-      expect(registerTool).toHaveBeenCalledTimes(24);
+      expect(registerTool).toHaveBeenCalledTimes(27);
       build();
       expect(registeredNames()).toEqual(
         expect.arrayContaining(["vault_get_download_url", "vault_get_upload_url"]),
       );
-      expect(registerTool).toHaveBeenCalledTimes(26);
+      expect(registerTool).toHaveBeenCalledTimes(29);
     });
 
     test("setSignedUrlsEnabled adds and removes the tools without rebuilding the handler", () => {
@@ -2506,8 +2552,8 @@ describe("McpHandler", () => {
 
       const first = await send(1);
       const second = await send(2);
-      expect(first.body.result.tools).toHaveLength(26);
-      expect(second.body.result.tools).toHaveLength(26);
+      expect(first.body.result.tools).toHaveLength(29);
+      expect(second.body.result.tools).toHaveLength(29);
       expect(first.headers["mcp-session-id"]).toBeUndefined();
       expect(second.headers["mcp-session-id"]).toBeUndefined();
     });
@@ -2669,7 +2715,7 @@ describe("McpHandler", () => {
         .send(sessionlessRequest(1, "tools/list"))
         .expect(200);
 
-      expect(res.body.result.tools).toHaveLength(26);
+      expect(res.body.result.tools).toHaveLength(29);
       expect(res.headers["mcp-session-id"]).toBeUndefined();
     });
 
@@ -2797,7 +2843,7 @@ describe("McpHandler", () => {
         .expect(200);
 
       const message = sseResult(res.text);
-      expect(message.result.tools).toHaveLength(26);
+      expect(message.result.tools).toHaveLength(29);
       const vaultList = (message.result.tools as { name: string; inputSchema: unknown }[]).find(
         (t) => t.name === "vault_list",
       );

@@ -184,3 +184,61 @@ describe("search log", () => {
     expect(lines).toHaveLength(1);
   });
 });
+
+describe("compact search, note_find and related notes", () => {
+  const fixtures = [
+    { path: "Resources/Software 2.0.md", content: "Neural networks written by optimisation.", frontmatter: { description: "Karpathy's Software 2.0" } },
+    { path: "Resources/Physical AI.md", content: "Robots learn in simulation: Isaac Sim, OpenUSD scenes, world models.", frontmatter: { description: "AI in robots" } },
+    { path: "Projects/Robotics Infra Roadmap.md", content: "Phase 2: Isaac Lab on a 4060 Ti, SimReady USD assets." },
+    { path: "Resources/Posts/HY-World 2.0.md", content: "Tencent world model: text to 3D world, export to Isaac Sim, OpenUSD, Blender." },
+    { path: "Resources/Kafka.md", content: "Log-based message broker, partitions and consumer groups." },
+    { path: "Private/x.md", content: "Isaac Sim secret" },
+  ];
+
+  test("compactSearch returns filename, score, description and coverage only", async () => {
+    const { ops } = setup(fixtures);
+    const { results } = await ops.compactSearch("software 2.0", { mode: "all" });
+    expect(results).toEqual([
+      { filename: "Resources/Software 2.0.md", score: expect.any(Number), description: "Karpathy's Software 2.0", coverage: 1 },
+    ]);
+  });
+
+  test("findNotes reports no match for a new name and an exact one for an existing name", async () => {
+    const { ops } = setup(fixtures);
+    const [none, hy, sw] = await ops.findNotes(["SimReady Central", "HY World 3.0", "software 2.0"]);
+    expect(none.matches).toEqual([]);
+    expect(hy.matches).toEqual([expect.objectContaining({ path: "Resources/Posts/HY-World 2.0.md", kind: "similar" })]);
+    expect(sw.matches).toEqual([
+      expect.objectContaining({ path: "Resources/Software 2.0.md", kind: "exact", via: "title", description: "Karpathy's Software 2.0" }),
+    ]);
+  });
+
+  test("relatedNotes finds notes sharing distinctive words, marks existing links, hides excluded paths", async () => {
+    const { app, ops } = setup(fixtures);
+    app.metadataCache.resolvedLinks = { "Resources/Posts/HY-World 2.0.md": { "Resources/Physical AI.md": 1 } };
+    const r = await ops.relatedNotes({ path: "Resources/Posts/HY-World 2.0.md" });
+    expect(r.terms).toEqual(expect.arrayContaining(["isaac", "openusd"]));
+    const names = r.results.map((x) => x.filename);
+    expect(names.slice(0, 2).sort()).toEqual(["Projects/Robotics Infra Roadmap.md", "Resources/Physical AI.md"]);
+    expect(names).not.toContain("Resources/Posts/HY-World 2.0.md");
+    expect(names).not.toContain("Private/x.md");
+    expect(r.results.find((x) => x.filename === "Resources/Physical AI.md")?.linked).toBe("out");
+    await expect(ops.relatedNotes({})).rejects.toThrow(/path.*text/);
+  });
+});
+
+describe("lintVault on a single note", () => {
+  test("checks only that note but judges duplicate names and tag variants against the vault", async () => {
+    const { ops } = setup([
+      { path: "new.md", content: "x".repeat(400), tags: ["#AI"] },
+      { path: "Resources/New.md", content: "y".repeat(400), frontmatter: { description: "d" }, tags: ["#ai"] },
+      { path: "other.md", content: "short", tags: ["#Foo"] },
+      { path: "other2.md", content: "short", tags: ["#foo"] },
+    ]);
+    const r = await ops.lintVault({ path: "new.md" });
+    expect(r.missingDescription.items).toEqual(["new.md"]);
+    expect(r.stubs.count).toBe(0);
+    expect(r.duplicateTitles.items).toEqual([["new.md", "Resources/New.md"]]);
+    expect(r.tagVariants.items).toEqual([{ AI: 1, ai: 1 }]);
+  });
+});

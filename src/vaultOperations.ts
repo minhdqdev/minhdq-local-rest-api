@@ -49,6 +49,7 @@ import {
   SearchJsonResponseItem,
   SearchResponseItem,
   SimpleSearchOptions,
+  CompactSearchItem,
   SimpleSearchResult,
 } from "./types";
 import { toArrayBuffer } from "./utils";
@@ -851,10 +852,14 @@ export class VaultOperations {
   async lintVault(
     { path: dirPath = "", limit = 50, stubBytes = 300 }: { path?: string; limit?: number; stubBytes?: number } = {},
   ): Promise<Record<string, { count: number; items: unknown[] }>> {
-    if (dirPath) this.assertContained(dirPath, "Directory path");
-    const prefix = dirPath ? `${dirPath.replace(/\/+$/, "")}/` : "";
-    const files = this.readableMarkdownFiles().filter((f) => f.path.startsWith(prefix));
-    const readable = new Set(this.readableMarkdownFiles().map((f) => f.path));
+    if (dirPath) this.assertContained(dirPath, "Path");
+    const all = this.readableMarkdownFiles();
+    // A path naming one note lints just that note -- duplicates and tag variants are
+    // still judged against the whole vault.
+    const single = dirPath ? all.find((f) => f.path === dirPath) : undefined;
+    const prefix = dirPath && !single ? `${dirPath.replace(/\/+$/, "")}/` : "";
+    const files = single ? [single] : all.filter((f) => f.path.startsWith(prefix));
+    const readable = new Set(all.map((f) => f.path));
     const backlinks = this.getBacklinksIndex();
     const report: Record<string, { count: number; items: unknown[] }> = {};
     const add = (check: string, item: unknown) => {
@@ -887,17 +892,29 @@ export class VaultOperations {
       } else if (/^---\r?\n/.test(head) && !cache?.frontmatterPosition) {
         add("brokenFrontmatter", { path: f.path, problem: "frontmatter block does not parse as YAML" });
       }
+    }
+    const ownTitle = single ? foldText(single.basename) : null;
+    const ownTags = new Set<string>();
+    if (single) {
+      const c = this.app.metadataCache.getFileCache(single);
+      for (const tag of c ? (getAllTags(c) ?? []) : []) ownTags.add(tag.replace(/^#/, "").toLowerCase().replace(/_/g, "-"));
+    }
+    for (const f of single ? all : files) {
       const key = foldText(f.basename);
       titles.set(key, [...(titles.get(key) ?? []), f.path]);
+      const cache = this.app.metadataCache.getFileCache(f);
       for (const tag of cache ? (getAllTags(cache) ?? []) : []) {
         const name = tag.replace(/^#/, "");
         const norm = name.toLowerCase().replace(/_/g, "-");
+        if (single && !ownTags.has(norm)) continue;
         const spellings = tagSpellings.get(norm) ?? new Map<string, number>();
         spellings.set(name, (spellings.get(name) ?? 0) + 1);
         tagSpellings.set(norm, spellings);
       }
     }
-    for (const paths of titles.values()) if (paths.length > 1) add("duplicateTitles", paths);
+    for (const [key, paths] of titles) {
+      if (paths.length > 1 && (ownTitle === null || key === ownTitle)) add("duplicateTitles", paths);
+    }
     for (const spellings of tagSpellings.values()) {
       if (spellings.size > 1) add("tagVariants", Object.fromEntries(spellings));
     }
@@ -1467,6 +1484,7 @@ export class VaultOperations {
       maxMatchesPerFile = Infinity,
       path: folder,
       tags,
+      mode,
     }: SimpleSearchOptions = {},
   ): Promise<SimpleSearchResult> {
     if (folder) this.assertContained(folder, "Directory path");
@@ -1474,6 +1492,7 @@ export class VaultOperations {
       limit: Number.isFinite(maxResults) ? maxResults : undefined,
       path: folder || undefined,
       tags: tags && tags.length ? tags : undefined,
+      mode,
     });
     const results: SearchResponseItem[] = [];
     const readable = new Map(this.readableMarkdownFiles().map((file) => [file.path, file]));
@@ -1522,6 +1541,113 @@ export class VaultOperations {
 
     void this.logSearch(query, folder, tags, total, results);
     return { results, totalResults: total };
+  }
+
+  /** Ranked search returning only filename, score, description and coverage per note --
+   *  for choosing notes, at a fraction of the tokens of match context. */
+  async compactSearch(
+    query: string,
+    { maxResults, path: folder, tags, mode }: SimpleSearchOptions = {},
+  ): Promise<{ results: CompactSearchItem[]; totalResults: number }> {
+    if (folder) this.assertContained(folder, "Directory path");
+    const { total, hits } = await this.vaultSearch.search(query, {
+      limit: maxResults !== undefined && Number.isFinite(maxResults) ? maxResults : undefined,
+      path: folder || undefined,
+      tags: tags && tags.length ? tags : undefined,
+      mode,
+    });
+    const results = hits.map((h) => ({
+      filename: h.path,
+      score: h.score,
+      ...(h.meta ? { description: clip(h.meta.split("\n")[0], 160) } : {}),
+      coverage: h.coverage,
+    }));
+    void this.logSearch(
+      query, folder, tags, total,
+      results.map((r) => ({ filename: r.filename, score: r.score, matches: [] as SearchContext[], totalMatches: 0 })),
+    );
+    return { results, totalResults: total };
+  }
+
+  /** For each name, the notes already called that (or nearly): the dedupe check
+   *  before creating a note. Matches title and aliases, ignoring case, tone
+   *  placement and -- one rung down -- every diacritic. */
+  async findNotes(
+    names: string[],
+    { limit = 5, similarity = 0.6 }: { limit?: number; similarity?: number } = {},
+  ): Promise<Array<{ name: string; matches: Array<Record<string, unknown>> }>> {
+    const out: Array<{ name: string; matches: Array<Record<string, unknown>> }> = [];
+    for (const name of names) {
+      const matches = await this.vaultSearch.findByName(name, { limit, similarity });
+      out.push({
+        name,
+        matches: matches.map((m) => ({
+          path: m.path,
+          kind: m.kind,
+          via: m.via,
+          ...(m.via === "alias" || m.aliases.length ? { aliases: m.aliases } : {}),
+          ...(m.meta ? { description: clip(m.meta.split("\n")[0], 160) } : {}),
+        })),
+      });
+    }
+    return out;
+  }
+
+  /** Notes sharing the most distinctive words with a note (path) or a text: a lexical
+   *  "more like this", for finding where a new source should be linked. Each result
+   *  says whether it is already linked to the note. */
+  async relatedNotes({
+    path: notePath,
+    text,
+    limit = 10,
+    folder,
+    tags,
+  }: { path?: string; text?: string; limit?: number; folder?: string; tags?: string[] }): Promise<{
+    terms: string[];
+    totalResults: number;
+    results: Array<CompactSearchItem & { linked?: "out" | "in" | "both" }>;
+  }> {
+    if (!notePath && !text) throw new Error("Give path (a note) or text.");
+    if (folder) this.assertContained(folder, "Directory path");
+    let body = text ?? "";
+    let title = "";
+    let out = new Set<string>();
+    let inbound = new Set<string>();
+    if (notePath) {
+      this.assertContained(notePath, "Path");
+      const file = this.app.vault.getAbstractFileByPath(notePath);
+      if (!(file instanceof TFile)) throw new Error(`No note at ${notePath}`);
+      const cache = this.app.metadataCache.getFileCache(file);
+      const start = cache?.frontmatterPosition?.end?.offset ?? 0;
+      const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
+      const desc = ["description", "summary", "tldr"].map((k) => fm[k]).filter((v) => typeof v === "string").join("\n");
+      body = `${desc}\n${(cache?.headings ?? []).map((h) => h.heading).join("\n")}\n${(await this.app.vault.cachedRead(file)).slice(start)}\n${body}`;
+      title = file.basename;
+      out = new Set(Object.keys(this.app.metadataCache.resolvedLinks[file.path] ?? {}));
+      inbound = new Set(this.getBacklinksIndex()[file.path] ?? []);
+    }
+    const { terms, total, hits } = await this.vaultSearch.related(body, {
+      title,
+      limit,
+      exclude: notePath ? [notePath] : [],
+      ...(notePath ? { self: notePath } : {}),
+      path: folder || undefined,
+      tags: tags && tags.length ? tags : undefined,
+    });
+    return {
+      terms,
+      totalResults: total,
+      results: hits.map((h) => {
+        const linked = out.has(h.path) && inbound.has(h.path) ? "both" : out.has(h.path) ? "out" : inbound.has(h.path) ? "in" : undefined;
+        return {
+          filename: h.path,
+          score: h.score,
+          ...(h.meta ? { description: clip(h.meta.split("\n")[0], 160) } : {}),
+          coverage: h.coverage,
+          ...(linked ? { linked } : {}),
+        };
+      }),
+    };
   }
 
   /** Append one line per simple search to `search-log.jsonl` in this plugin's own

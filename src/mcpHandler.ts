@@ -21,6 +21,7 @@ import express from "express";
 import mime from "mime-types";
 import { TFile } from "obsidian";
 import { dedent } from "ts-dedent";
+import { stringify as stringifyYaml } from "yaml";
 
 import { VaultOperations } from "./vaultOperations";
 import type { InstructionInput, ReadTarget } from "markdown-patch-2";
@@ -764,6 +765,60 @@ export class McpHandler {
    * The write preconditions an MCP call asked for, parsed exactly as REST parses
    * its If-Match/If-None-Match headers. Undefined when it asked for none.
    */
+  /** vault_write and vault_batch's write op: full content, or a frontmatter object plus a body. */
+  private async writeNote({
+    path, content, frontmatter, ifMatch, ifNoneMatch,
+  }: { path: string; content: string; frontmatter?: Record<string, unknown>; ifMatch?: string; ifNoneMatch?: "*" }): Promise<string> {
+    let full = content;
+    if (frontmatter !== undefined) {
+      if (/^---\r?\n/.test(content)) {
+        throw new Error("Pass frontmatter either as the frontmatter object or inside content, not both: content already starts with ---.");
+      }
+      const yaml = stringifyYaml(frontmatter, { lineWidth: 0 }).trimEnd();
+      full = `---\n${yaml}\n---\n${content.startsWith("\n") ? "" : "\n"}${content}`;
+    }
+    assertTextWrite(path, full);
+    return this.ops.writeFileContent(this.vaultPath(path), full, this.preconditions(ifMatch, ifNoneMatch));
+  }
+
+  private async appendNote({
+    path, content, ifMatch, ifNoneMatch,
+  }: { path: string; content: string; ifMatch?: string; ifNoneMatch?: "*" }): Promise<string> {
+    assertTextWrite(path, content);
+    return this.ops.appendFileContent(this.vaultPath(path), content, this.preconditions(ifMatch, ifNoneMatch));
+  }
+
+  /** vault_patch and vault_batch's patch op. */
+  private async patchNote(
+    path: string,
+    fields: Record<string, unknown>,
+  ): Promise<{ version: string; warnings: unknown[] }> {
+    const { targetType, target } = fields;
+    // Heading targets only: block/frontmatter targets are legitimately
+    // strings and must never be JSON-parsed.
+    let normalizedTarget = target;
+    if (targetType === "heading" && typeof target === "string") {
+      const parsed = parseStringHeadingTarget(target);
+      if (parsed === undefined) {
+        throw new Error(
+          `target: a heading target must be an array of heading texts, or null for the document root, not a bare string (${HEADING_TARGET_STRING_HINT})`,
+        );
+      }
+      normalizedTarget = parsed;
+    }
+    // Assemble the instruction with exactly the fields that were supplied,
+    // so the engine sees the discriminated-union shape it expects. It
+    // validates the operation×scope×targetType combination and the carrier.
+    const instruction: Record<string, unknown> = { targetType, target: normalizedTarget, operation: fields.operation };
+    for (const k of [
+      "within", "scope", "content", "value", "destination", "ifMatch", "createTargetIfMissing", "rejectIfContentPreexists",
+    ]) {
+      if (fields[k] !== undefined) instruction[k] = fields[k];
+    }
+    const result = await this.ops.patchFileSectionMdp2(this.vaultPath(path), instruction as InstructionInput);
+    return { version: versionOf(result.document), warnings: result.warnings };
+  }
+
   private preconditions(ifMatch?: string, ifNoneMatch?: "*"): WritePreconditions | undefined {
     if (ifMatch === undefined && ifNoneMatch === undefined) return undefined;
     const preconditions: WritePreconditions = {};
@@ -1378,10 +1433,10 @@ export class McpHandler {
     this.tool(
       "vault_lint",
       dedent`
-        Health report on the vault, or on one folder: unresolvedLinks (links to notes that do not exist), orphans (notes with no links in or out), stubs (notes under stubBytes), missingDescription (no frontmatter description/summary/tldr), unreviewedAiSummaries (ai_summary: true), duplicateTitles (names equal once case and diacritics are ignored, e.g. "hoá"/"hóa"), tagVariants (tags differing only in case or _/-), and brokenFrontmatter (stray text before the opening ---, or YAML that does not parse -- Obsidian then ignores the note's tags and description). Each check gives a count and up to limit items. It only reports -- fix with vault_patch, frontmatter_update_many or tag_rename, and ask the owner before deleting or merging notes. Excluded paths are not inspected.
+        Health report on the vault, one folder, or one note (pass a note's path to check it right after creating or editing it; duplicate names and tag variants are then judged against the whole vault): unresolvedLinks (links to notes that do not exist), orphans (notes with no links in or out), stubs (notes under stubBytes), missingDescription (no frontmatter description/summary/tldr), unreviewedAiSummaries (ai_summary: true), duplicateTitles (names equal once case and diacritics are ignored, e.g. "hoá"/"hóa"), tagVariants (tags differing only in case or _/-), and brokenFrontmatter (stray text before the opening ---, or YAML that does not parse -- Obsidian then ignores the note's tags and description). Each check gives a count and up to limit items. It only reports -- fix with vault_patch, frontmatter_update_many or tag_rename, and ask the owner before deleting or merging notes. Excluded paths are not inspected.
       `,
       {
-        path: z.string().optional().describe("Folder to inspect (default: the whole vault)"),
+        path: z.string().optional().describe("Folder to inspect, or one note to check right after writing it (default: the whole vault)"),
         limit: z.number().int().min(1).max(500).optional().describe("The most items to list per check (default 50)"),
         stubBytes: z.number().int().min(1).max(10_000).optional().describe("Size below which a note counts as a stub (default 300)"),
       },
@@ -1389,7 +1444,7 @@ export class McpHandler {
       async ({ path, limit, stubBytes }: { path?: string; limit?: number; stubBytes?: number }) =>
         this.text(
           await this.ops.lintVault({
-            ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
+            ...(path ? { path: this.vaultPath(path, "Path") } : {}),
             limit,
             stubBytes,
           }),
@@ -1559,33 +1614,25 @@ export class McpHandler {
 
     this.tool(
       "vault_write",
-      dedent`Create or overwrite a vault file with the given content. Text only: a path whose extension names an image, audio, video, font, PDF or archive type is refused, as is content containing a NUL byte, because writing text there would corrupt the file -- upload those bytes with vault_get_upload_url, or PUT /vault/<path> over the REST API. Creates any missing parent directories automatically. Overwrites without warning if the file already exists, unless you pass ifMatch (overwrite only the version you read) or ifNoneMatch '*' (create only). Returns the written file's new version token.`,
+      dedent`Create or overwrite a vault file with the given content. Text only: a path whose extension names an image, audio, video, font, PDF or archive type is refused, as is content containing a NUL byte, because writing text there would corrupt the file -- upload those bytes with vault_get_upload_url, or PUT /vault/<path> over the REST API. Creates any missing parent directories automatically. Overwrites without warning if the file already exists, unless you pass ifMatch (overwrite only the version you read) or ifNoneMatch '*' (create only). To give a new note frontmatter, pass it as the frontmatter object and only the body as content -- it is written as YAML for you, so quoting and escaping are never your problem. Returns the written file's new version token.`,
       {
         path: z.string().describe(VAULT_PATH_DESCRIPTION),
-        content: z.string().describe("Full file content (markdown text)"),
+        content: z.string().describe("Full file content (markdown text), or only the body when frontmatter is given"),
+        frontmatter: z
+          .record(z.unknown())
+          .optional()
+          .describe('Frontmatter as a JSON object, e.g. {"description": "…", "tags": ["ai", "rag"]}; written as a YAML block before content'),
         ifMatch: IF_MATCH_FIELD,
         ifNoneMatch: IF_NONE_MATCH_FIELD,
       },
       { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      async ({
-        path,
-        content,
-        ifMatch,
-        ifNoneMatch,
-      }: {
+      async (args: {
         path: string;
         content: string;
+        frontmatter?: Record<string, unknown>;
         ifMatch?: string;
         ifNoneMatch?: "*";
-      }) => {
-        assertTextWrite(path, content);
-        const version = await this.ops.writeFileContent(
-          this.vaultPath(path),
-          content,
-          this.preconditions(ifMatch, ifNoneMatch),
-        );
-        return this.text({ message: "OK", version });
-      },
+      }) => this.text({ message: "OK", version: await this.writeNote(args) }),
     );
 
     this.tool(
@@ -1666,25 +1713,8 @@ export class McpHandler {
         ifNoneMatch: IF_NONE_MATCH_FIELD,
       },
       { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-      async ({
-        path,
-        content,
-        ifMatch,
-        ifNoneMatch,
-      }: {
-        path: string;
-        content: string;
-        ifMatch?: string;
-        ifNoneMatch?: "*";
-      }) => {
-        assertTextWrite(path, content);
-        const version = await this.ops.appendFileContent(
-          this.vaultPath(path),
-          content,
-          this.preconditions(ifMatch, ifNoneMatch),
-        );
-        return this.text({ message: "OK", version });
-      },
+      async (args: { path: string; content: string; ifMatch?: string; ifNoneMatch?: "*" }) =>
+        this.text({ message: "OK", version: await this.appendNote(args) }),
     );
 
     this.tool(
@@ -1710,74 +1740,82 @@ export class McpHandler {
         ...InstructionInputObjectSchema.shape,
       },
       { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+      async ({ path, ...fields }: { path: string } & Record<string, unknown>) => {
+        const { version, warnings } = await this.patchNote(path, fields);
+        return warnings.length > 0
+          ? this.text({ message: "OK", version, warnings })
+          : this.text({ message: "OK", version });
+      },
+    );
+
+    this.tool(
+      "vault_batch",
+      dedent`
+        Several writes in one call, applied in order: op 'write' (path, content, optional frontmatter object, ifMatch, ifNoneMatch -- as vault_write), 'append' (path, content, ifMatch, ifNoneMatch -- as vault_append), or 'patch' (path plus instruction: the same fields vault_patch takes -- targetType, target, operation, scope, content, value, ifMatch, createTargetIfMissing...). Each operation keeps its own preconditions. Not a transaction: operations before a failure stay applied. By default the batch stops at the first failure and reports the rest as skipped; stopOnError false runs them all. Returns one result per operation with its new version or its error. Typical use: an ingest -- write the source note, patch each related note, append the log line.
+      `,
+      {
+        operations: z
+          .array(
+            z.object({
+              op: z.enum(["write", "append", "patch"]),
+              path: z.string().describe(VAULT_PATH_DESCRIPTION),
+              content: z.string().optional().describe("write/append: the text"),
+              frontmatter: z.record(z.unknown()).optional().describe("write: frontmatter as a JSON object"),
+              ifMatch: IF_MATCH_FIELD,
+              ifNoneMatch: IF_NONE_MATCH_FIELD,
+              instruction: z
+                .record(z.unknown())
+                .optional()
+                .describe("patch: the vault_patch fields (targetType, target, operation, scope, content/value/destination, ifMatch, createTargetIfMissing, ...)"),
+            }),
+          )
+          .min(1)
+          .max(50),
+        stopOnError: z.boolean().optional().describe("Stop at the first failed operation (default true)"),
+      },
+      { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
       async ({
-        path,
-        targetType,
-        target,
-        within,
-        operation,
-        scope,
-        content,
-        value,
-        destination,
-        ifMatch,
-        createTargetIfMissing,
-        rejectIfContentPreexists,
+        operations,
+        stopOnError = true,
       }: {
-        path: string;
-        targetType: "heading" | "block" | "frontmatter";
-        target: string[] | string | null;
-        within?: number;
-        operation: "replace" | "prepend" | "append" | "delete";
-        scope?: "content" | "marker" | "markerAndContent" | "parent";
-        content?: string;
-        value?: unknown;
-        destination?: unknown;
-        ifMatch?: string;
-        createTargetIfMissing?: boolean;
-        rejectIfContentPreexists?: boolean;
+        operations: Array<{
+          op: "write" | "append" | "patch";
+          path: string;
+          content?: string;
+          frontmatter?: Record<string, unknown>;
+          ifMatch?: string;
+          ifNoneMatch?: "*";
+          instruction?: Record<string, unknown>;
+        }>;
+        stopOnError?: boolean;
       }) => {
-        // Heading targets only: block/frontmatter targets are legitimately
-        // strings and must never be JSON-parsed.
-        let normalizedTarget = target;
-        if (targetType === "heading" && typeof target === "string") {
-          const parsed = parseStringHeadingTarget(target);
-          if (parsed === undefined) {
-            throw new Error(
-              `target: a heading target must be an array of heading texts, or null for the document root, not a bare string (${HEADING_TARGET_STRING_HINT})`,
-            );
+        const results: Array<Record<string, unknown>> = [];
+        let failed = false;
+        for (const [index, o] of operations.entries()) {
+          if (failed && stopOnError) {
+            results.push({ index, op: o.op, path: o.path, status: "skipped" });
+            continue;
           }
-          normalizedTarget = parsed;
+          try {
+            if (o.op === "patch") {
+              if (!o.instruction) throw new Error("patch needs instruction");
+              const { version, warnings } = await this.patchNote(o.path, o.instruction);
+              results.push({ index, op: o.op, path: o.path, status: "ok", version, ...(warnings.length ? { warnings } : {}) });
+            } else {
+              if (o.content === undefined) throw new Error(`${o.op} needs content`);
+              const args = { path: o.path, content: o.content, ifMatch: o.ifMatch, ifNoneMatch: o.ifNoneMatch };
+              const version = o.op === "write"
+                ? await this.writeNote({ ...args, frontmatter: o.frontmatter })
+                : await this.appendNote(args);
+              results.push({ index, op: o.op, path: o.path, status: "ok", version });
+            }
+          } catch (error) {
+            failed = true;
+            results.push({ index, op: o.op, path: o.path, status: "error", error: error instanceof Error ? error.message : String(error) });
+          }
         }
-        // Assemble the instruction with exactly the fields that were supplied,
-        // so the engine sees the discriminated-union shape it expects. It
-        // validates the operation×scope×targetType combination and the carrier.
-        const instruction: Record<string, unknown> = {
-          targetType,
-          target: normalizedTarget,
-          operation,
-          ...(within !== undefined ? { within } : {}),
-          ...(scope !== undefined ? { scope } : {}),
-          ...(content !== undefined ? { content } : {}),
-          ...(value !== undefined ? { value } : {}),
-          ...(destination !== undefined ? { destination } : {}),
-          ...(ifMatch !== undefined ? { ifMatch } : {}),
-          ...(createTargetIfMissing !== undefined ? { createTargetIfMissing } : {}),
-          ...(rejectIfContentPreexists !== undefined ? { rejectIfContentPreexists } : {}),
-        };
-        try {
-          const result = await this.ops.patchFileSectionMdp2(
-            this.vaultPath(path),
-            instruction as InstructionInput,
-          );
-          const version = versionOf(result.document);
-          return result.warnings.length > 0
-            ? this.text({ message: "OK", version, warnings: result.warnings })
-            : this.text({ message: "OK", version });
-        } catch (e) {
-          // Surface the engine's message to the caller.
-          throw e instanceof Error ? e : new Error(String(e));
-        }
+        const ok = results.filter((r) => r.status === "ok").length;
+        return this.text({ ok, failed: results.filter((r) => r.status === "error").length, skipped: results.length - ok - results.filter((r) => r.status === "error").length, results });
       },
     );
 
@@ -2011,11 +2049,19 @@ export class McpHandler {
 
     this.tool(
       "search_simple",
-      dedent`Ranked full-text search over the vault (BM25 over note name, aliases, headings, tags, frontmatter description/summary and body; the note name weighs most). Works for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics ("san pham" finds "sản phẩm"), old and new tone placement are the same word ("hoá" = "hóa"), and exact-accent and whole-phrase matches rank above loose ones; a note matching only some of the query's words ranks lower. Returns an array of {filename, score, matches, totalMatches} objects sorted by score, highest first. Each match includes the matched text and surrounding context characters (controlled by contextLength); a file's matches come best first (whole phrases, then exact-accent words, then the rest), and a content match carries the heading path it sits under. Narrow with path (a folder) and tags. Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the best ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
+      dedent`Ranked full-text search over the vault (BM25 over note name, aliases, headings, tags, frontmatter description/summary and body; the note name weighs most). Works for Vietnamese as well as English: words match whole and case-insensitively, with or without diacritics ("san pham" finds "sản phẩm"), old and new tone placement are the same word ("hoá" = "hóa"), and exact-accent and whole-phrase matches rank above loose ones; a note matching only some of the query's words ranks lower. Returns an array of {filename, score, matches, totalMatches} objects sorted by score, highest first. Each match includes the matched text and surrounding context characters (controlled by contextLength); a file's matches come best first (whole phrases, then exact-accent words, then the rest), and a content match carries the heading path it sits under. Narrow with path (a folder) and tags. mode 'all' keeps only notes containing every word; 'phrase' only notes where the words appear together, in order, in one field -- use it to check whether a note on "HY-World 2.0" exists without "Software 2.0" crowding in (or use note_find, which matches names only). compact: true drops the match context and returns {filename, score, description, coverage} per note -- the cheap way to pick notes. Results are limited to the ${SEARCH_SIMPLE_DEFAULT_MAX_RESULTS} highest-scoring files and the best ${SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE} matches in each unless maxResults or maxMatchesPerFile say otherwise; each file's totalMatches gives how many matches it had in all, and a second text block says how much was left out whenever anything was.`,
       {
         query: z.string().describe("Search query string"),
         path: z.string().optional().describe("Only notes under this folder, e.g. \"Resources/\" (compared ignoring case and diacritics)"),
         tags: z.array(z.string()).optional().describe("Only notes having any of these tags; \"ai\" also matches \"ai/rag\""),
+        mode: z
+          .enum(["any", "all", "phrase"])
+          .optional()
+          .describe("any (default): rank notes matching some of the words; all: every word must appear; phrase: the words must appear next to each other, in order"),
+        compact: z
+          .boolean()
+          .optional()
+          .describe("Return only filename, score, description and coverage per note, no match context (default false)"),
         contextLength: z
           .number()
           .int()
@@ -2041,6 +2087,8 @@ export class McpHandler {
         query,
         path,
         tags,
+        mode,
+        compact,
         contextLength,
         maxResults = SEARCH_SIMPLE_DEFAULT_MAX_RESULTS,
         maxMatchesPerFile = SEARCH_SIMPLE_DEFAULT_MAX_MATCHES_PER_FILE,
@@ -2048,16 +2096,33 @@ export class McpHandler {
         query: string;
         path?: string;
         tags?: string[];
+        mode?: "any" | "all" | "phrase";
+        compact?: boolean;
         contextLength?: number;
         maxResults?: number;
         maxMatchesPerFile?: number;
       }) => {
+        const filters = {
+          ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
+          ...(tags && tags.length ? { tags } : {}),
+          ...(mode ? { mode } : {}),
+        };
+        if (compact) {
+          const { results, totalResults } = await this.ops.compactSearch(query, { maxResults, ...filters });
+          const result = this.text(results);
+          if (totalResults > results.length) {
+            result.content.push({
+              type: "text" as const,
+              text: `[${totalResults - results.length} more matching files (${totalResults} in all) not shown because of maxResults=${maxResults}.]`,
+            });
+          }
+          return result;
+        }
         const { results, totalResults } = await this.ops.simpleSearch(query, {
           contextLength,
           maxResults,
           maxMatchesPerFile,
-          ...(path ? { path: this.vaultPath(path, "Directory path") } : {}),
-          ...(tags && tags.length ? { tags } : {}),
+          ...filters,
         });
         const result = this.text(results);
         const omittedFiles = totalResults - results.length;
@@ -2089,12 +2154,68 @@ export class McpHandler {
     );
 
     this.tool(
-      "tag_list",
-      dedent`Return all tags used across the vault, each with a usage count. Tag names do not include the leading '#'. This tool is read-only. To add a tag to a specific file, use vault_patch with targetType 'frontmatter', target 'tags', operation 'append', and value ["tag-name"] (set createTargetIfMissing to true if the file may have no tags yet). To remove a tag, read the current tags list with vault_read, filter client-side, then replace the whole field with vault_patch using operation 'replace' and value set to the filtered list. For full examples, read the OpenAPI spec resource at obsidian://local-rest-api/openapi.yaml.`,
-      {},
+      "note_find",
+      dedent`
+        Check whether notes already exist under given names, before creating one. For each name, returns the notes whose title or alias is that name -- kind "exact" (same accents; old/new tone placement count as the same, so "hoá" = "hóa"), "folded" (same once case and all diacritics are dropped), "contains" (every word of the name is in the title/alias), or "similar" (most words shared) -- best first, each with its path and description. Names only: body text is not searched, so "HY-World 2.0" never matches "Software 2.0" on the "2.0". An empty matches list means no note goes by that name.
+      `,
+      {
+        names: z.array(z.string()).min(1).max(50).describe("Note names to look up, e.g. [\"HY-World 2.0\", \"SimReady Central\"]"),
+        limit: z.number().int().min(1).max(50).optional().describe("The most matches per name (default 5)"),
+        similarity: z.number().min(0.1).max(1).optional().describe("Word overlap (Jaccard) needed for a 'similar' match (default 0.6)"),
+      },
       READ_ONLY_ANNOTATIONS,
-      async () => {
-        return this.text({ tags: this.ops.getAllTags() });
+      async ({ names, limit, similarity }: { names: string[]; limit?: number; similarity?: number }) =>
+        this.text(await this.ops.findNotes(names, { limit, similarity })),
+    );
+
+    this.tool(
+      "search_related",
+      dedent`
+        Find notes related to a note (path) or to a piece of text: picks the text's most distinctive words (tf-idf against the vault; title words count triple, words common to more than a fifth of the vault are ignored), then ranks notes sharing them. Returns the words it used (terms) and {filename, score, description, coverage, linked} per note; linked says whether the note already links to it ("out"), from it ("in") or both. Use it to find where a new source should be linked or what an existing note is missing. It is lexical, not semantic: it finds notes that share vocabulary, so pass text rich in the specific terms (product names, techniques), not a one-line summary.
+      `,
+      {
+        path: z.string().optional().describe("A note to find relatives of (its title, description, headings and body are used)"),
+        text: z.string().optional().describe("Text to find related notes for, e.g. a clipped article (added to the note's text if both are given)"),
+        folder: z.string().optional().describe("Only notes under this folder"),
+        tags: z.array(z.string()).optional().describe("Only notes having any of these tags"),
+        limit: z.number().int().min(1).max(100).optional().describe("The most notes to return (default 10)"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ path, text, folder, tags, limit }: { path?: string; text?: string; folder?: string; tags?: string[]; limit?: number }) =>
+        this.text(
+          await this.ops.relatedNotes({
+            ...(path ? { path: this.normalizedFilePath(path) } : {}),
+            ...(text ? { text } : {}),
+            ...(folder ? { folder: this.vaultPath(folder, "Directory path") } : {}),
+            ...(tags && tags.length ? { tags } : {}),
+            limit,
+          }),
+        ),
+    );
+
+    this.tool(
+      "tag_list",
+      dedent`Return the tags used across the vault, each with a usage count, most used first. Narrow with prefix (tags starting with it, e.g. "ai" → "ai", "ai/rag"), query (tags containing it, ignoring case and diacritics), minCount, and limit -- the vault has hundreds of one-off tags, so filter when choosing tags for a note. Tag names do not include the leading '#'. This tool is read-only. To add a tag to a specific file, use vault_patch with targetType 'frontmatter', target 'tags', operation 'append', and value ["tag-name"] (set createTargetIfMissing to true if the file may have no tags yet). To remove a tag, read the current tags list with vault_read, filter client-side, then replace the whole field with vault_patch using operation 'replace' and value set to the filtered list. For full examples, read the OpenAPI spec resource at obsidian://local-rest-api/openapi.yaml.`,
+      {
+        prefix: z.string().optional().describe("Only tags starting with this (case-insensitive)"),
+        query: z.string().optional().describe("Only tags containing this, ignoring case and diacritics"),
+        minCount: z.number().int().min(1).optional().describe("Only tags used at least this many times"),
+        limit: z.number().int().min(1).optional().describe("The most tags to return"),
+      },
+      READ_ONLY_ANNOTATIONS,
+      async ({ prefix, query, minCount, limit }: { prefix?: string; query?: string; minCount?: number; limit?: number }) => {
+        const fold = (t: string) => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/gi, "d").toLowerCase();
+        let tags = this.ops.getAllTags();
+        const total = tags.length;
+        if (prefix) tags = tags.filter((t) => t.name.toLowerCase().startsWith(prefix.replace(/^#/, "").toLowerCase()));
+        if (query) tags = tags.filter((t) => fold(t.name).includes(fold(query.replace(/^#/, ""))));
+        if (minCount) tags = tags.filter((t) => t.count >= minCount);
+        tags.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+        const matched = tags.length;
+        if (limit) tags = tags.slice(0, limit);
+        return this.text(
+          matched === total && tags.length === total ? { tags } : { tags, matched, totalTags: total },
+        );
       },
     );
 

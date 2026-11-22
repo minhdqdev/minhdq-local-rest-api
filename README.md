@@ -480,12 +480,22 @@ Three read-only tools this fork adds so an agent can find its way around a vault
 
 And four for upkeep:
 
-- `vault_lint` — a health report: unresolved links, orphans, stubs, notes without a description, unreviewed `ai_summary` descriptions, names that collide once case and diacritics are ignored, tag spelling variants, and broken frontmatter (stray text before `---`, or YAML that does not parse). Reports only.
+- `vault_lint` — a health report: unresolved links, orphans, stubs, notes without a description, unreviewed `ai_summary` descriptions, names that collide once case and diacritics are ignored, tag spelling variants, and broken frontmatter (stray text before `---`, or YAML that does not parse). Reports only. `path` may be a folder or a single note — check a note right after writing it.
 - `recent_changes` — notes modified since an ISO time or a span like `7d`, newest first, with descriptions.
 - `frontmatter_update_many` — set/unset frontmatter fields on up to 200 notes in one call; dry run by default.
 - `tag_rename` — rename (or merge) a tag in frontmatter and inline `#tag`s, nested tags included; dry run by default.
 
-`search_simple` also takes `path` and `tags` filters, and each content match carries the heading path it sits under.
+Three for finding the right note cheaply:
+
+- `note_find` — does a note called X already exist? Matches titles and aliases only (never body text), as `exact` (same accents, tone placement ignored), `folded` (same without diacritics), `contains` (every word of the name) or `similar` (most words shared), with descriptions. The dedupe step before creating a note.
+- `search_related` — notes related to a note (`path`) or a piece of `text`: picks the text's most distinctive words by tf-idf against the vault, ranks notes sharing them, and says whether each is already linked (`out`/`in`/`both`). Lexical, not semantic.
+- `search_simple` takes `mode` (`any` default, `all` = every word, `phrase` = words adjacent and in order within one field), `compact: true` (only `filename`, `score`, `description`, `coverage` per note), and `path` and `tags` filters; each content match carries the heading path it sits under.
+
+And for writing:
+
+- `vault_write` takes an optional `frontmatter` object, written as YAML before the body, so callers never hand-write quoting.
+- `vault_batch` — up to 50 `write` / `append` / `patch` operations in one call, in order, each with its own `ifMatch`; stops at the first failure unless `stopOnError: false`, and reports each operation's version or error. Not a transaction.
+- `tag_list` takes `prefix`, `query` (ignoring case and diacritics), `minCount` and `limit`, and sorts by usage.
 
 All of these honour excluded paths and the configuration-directory guard. They are MCP-only; there is no REST route for them.
 

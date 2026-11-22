@@ -10,7 +10,7 @@
  * changes, so a file the API may not read is never in it.
  */
 import { TFile, getAllTags, type App } from "obsidian";
-import { SearchIndex, type SearchDocument, type SearchHit, type SearchOptions } from "./engine";
+import { SearchIndex, type NameMatch, type SearchDocument, type SearchHit, type SearchOptions } from "./engine";
 
 const MAX_BODY_CHARS = 200_000;
 const META_FIELDS = ["description", "summary", "tldr"];
@@ -56,6 +56,30 @@ export class VaultSearch {
   async search(query: string, options: SearchOptions = {}): Promise<{ total: number; hits: SearchHit[] }> {
     await this.refresh();
     return this.index.search(query, options);
+  }
+
+  async findByName(name: string, options: { limit?: number; similarity?: number } = {}): Promise<NameMatch[]> {
+    await this.refresh();
+    return this.index.findByName(name, options);
+  }
+
+  /**
+   * Notes sharing the most distinctive words with a text: a lexical "more like this".
+   * The coverage penalty is softened (a related note rarely has every word) and the
+   * title bonus is off (the query is machine-built).
+   */
+  async related(
+    text: string,
+    { title, limit, exclude, path, tags, terms: termLimit = 12, self }:
+      { title?: string; limit?: number; exclude?: string[]; path?: string; tags?: string[]; terms?: number; self?: string } = {},
+  ): Promise<{ terms: string[]; total: number; hits: SearchHit[] }> {
+    await this.refresh();
+    const terms = this.index.distinctiveTerms(text, { title, limit: termLimit, self });
+    if (terms.length === 0) return { terms, total: 0, hits: [] };
+    const { total, hits } = this.index.search(terms.join(" "), {
+      limit, exclude, path, tags, coveragePower: 0.5, noTitleBonus: true,
+    });
+    return { terms, total, hits };
   }
 
   /** Bring the index up to date. Concurrent callers share one pass. */

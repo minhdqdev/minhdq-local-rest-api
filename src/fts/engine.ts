@@ -24,6 +24,33 @@ export interface SearchOptions {
   path?: string;
   /** Keep a note if it has any of these tags; `ai` also matches `ai/coding-agent`. */
   tags?: string[];
+  /**
+   * any (default): rank every note matching some query word. all: only notes containing
+   * every query word (in any field). phrase: only notes where the words appear next to
+   * each other, in order, within one field (title, alias, heading, description or body).
+   */
+  mode?: SearchMode;
+  /** Paths to leave out of the results. */
+  exclude?: Iterable<string>;
+  /** Exponent of the coverage penalty (default 2). Lower it for long, loose queries. */
+  coveragePower?: number;
+  /** Skip the whole-query title bonus (for machine-built queries). */
+  noTitleBonus?: boolean;
+}
+
+export type SearchMode = "any" | "all" | "phrase";
+
+export interface NameMatch {
+  path: string;
+  title: string;
+  aliases: string[];
+  meta?: string;
+  /** exact: same name with the same accents (tone placement ignored); folded: same once
+   *  case and every diacritic are dropped; contains: every word of the name appears in
+   *  the title or an alias; similar: most words shared. */
+  kind: "exact" | "folded" | "contains" | "similar";
+  /** Which name matched: the title or an alias. */
+  via: "title" | "alias";
 }
 
 export interface SearchHit {
@@ -74,6 +101,7 @@ interface StoredDoc {
   keys: string[];
   titleAccent: string;
   titleFold: string;
+  aliases: string[];
   aliasAccent: string[];
   aliasFold: string[];
 }
@@ -140,6 +168,7 @@ export class SearchIndex {
       keys: [...keys],
       titleAccent: accentText(doc.title),
       titleFold: foldText(doc.title),
+      aliases: doc.aliases ?? [],
       aliasAccent: (doc.aliases ?? []).map(accentText),
       aliasFold: (doc.aliases ?? []).map(foldText),
     });
@@ -178,8 +207,12 @@ export class SearchIndex {
     const foldWeight = qTokens.map((t) => (hasDiacritics(t) ? 0.3 : 0.7));
     const N = this.docs.size || 1;
 
+    const mode: SearchMode = options.mode ?? "any";
     const scores = new Map<number, number>();
     const matchedTerms = new Map<number, Set<number>>();
+    // phrase mode: per document and field, which consecutive query-word pairs were found
+    const pairHits = new Map<number, Map<FieldName, Set<number>>>();
+    const excluded = new Set(options.exclude ?? []);
     const matchedFields = new Map<number, Set<FieldName>>();
     const allowed = this.filter(options);
 
@@ -231,6 +264,13 @@ export class SearchIndex {
           const tfF = Math.max(0, (pf?.get(d) ?? 0) - tfA);
           const s = idfA * bm25(tfA, len, avg, B[field]) + w * idfF * bm25(tfF, len, avg, B[field]);
           if (s > 0) bump(d, boost * PHRASE_WEIGHT * s, null, field);
+          if (mode === "phrase" && (pa?.has(d) || pf?.has(d))) {
+            let byField = pairHits.get(d);
+            if (!byField) pairHits.set(d, (byField = new Map<FieldName, Set<number>>()));
+            let pairs = byField.get(field);
+            if (!pairs) byField.set(field, (pairs = new Set<number>()));
+            pairs.add(i);
+          }
         }
       }
     }
@@ -238,11 +278,19 @@ export class SearchIndex {
     const qAccText = qAcc.join(" ");
     const qFoldText = qFold.join(" ");
     const hits: SearchHit[] = [];
+    const pairsNeeded = qTokens.length - 1;
+    const power = options.coveragePower ?? 2;
     for (const [d, raw] of scores) {
       const doc = this.docs.get(d);
+      if (excluded.has(doc.path)) continue;
       const coverage = (matchedTerms.get(d)?.size ?? 0) / qTokens.length;
-      let score = raw * coverage * coverage;
-      score *= 1 + titleBonus(doc, qAccText, qFoldText);
+      if ((mode === "all" || mode === "phrase") && coverage < 1) continue;
+      if (mode === "phrase" && pairsNeeded > 0) {
+        const byField = pairHits.get(d);
+        if (!byField || ![...byField.values()].some((pairs) => pairs.size === pairsNeeded)) continue;
+      }
+      let score = raw * Math.pow(coverage, power);
+      if (!options.noTitleBonus) score *= 1 + titleBonus(doc, qAccText, qFoldText);
       hits.push({
         path: doc.path,
         title: doc.title,
@@ -255,6 +303,92 @@ export class SearchIndex {
     }
     hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
     return { total: hits.length, hits: hits.slice(0, limit) };
+  }
+
+  /**
+   * Notes whose name or alias is the given name, or close to it -- the check before
+   * creating a note ("does a note on this already exist?"). Ordered best first:
+   * exact, folded, contains, similar.
+   */
+  findByName(name: string, { limit = 10, similarity = 0.6 }: { limit?: number; similarity?: number } = {}): NameMatch[] {
+    const qAcc = accentText(name);
+    const qFold = foldText(name);
+    if (!qFold) return [];
+    // Light English plural folding for word comparisons ("world models" ~ "world model").
+    const stem = (w: string) => (w.length > 3 && w.endsWith("s") && !w.endsWith("ss") ? w.slice(0, -1) : w);
+    const qWords = new Set(qFold.split(" ").map(stem));
+    const rank = { exact: 0, folded: 1, contains: 2, similar: 3 } as const;
+    const out: Array<NameMatch & { sim: number }> = [];
+    for (const doc of this.docs.values()) {
+      const names: Array<[string, string, "title" | "alias"]> = [
+        [doc.titleAccent, doc.titleFold, "title"],
+        ...doc.aliasAccent.map((a, i): [string, string, "alias"] => [a, doc.aliasFold[i], "alias"]),
+      ];
+      let best: { kind: NameMatch["kind"]; via: "title" | "alias"; sim: number } | null = null;
+      for (const [acc, fold, via] of names) {
+        if (!fold) continue;
+        const words = new Set(fold.split(" ").map(stem));
+        const shared = [...qWords].filter((w) => words.has(w)).length;
+        const sim = shared / new Set([...qWords, ...words]).size;
+        let kind: NameMatch["kind"] | null = null;
+        if (acc === qAcc) kind = "exact";
+        else if (fold === qFold) kind = "folded";
+        else if (shared === qWords.size) kind = "contains";
+        else if (sim >= similarity) kind = "similar";
+        if (kind && (!best || rank[kind] < rank[best.kind] || (kind === best.kind && sim > best.sim))) {
+          best = { kind, via, sim };
+        }
+      }
+      if (best) {
+        out.push({
+          path: doc.path, title: doc.title, aliases: doc.aliases, meta: doc.meta,
+          kind: best.kind, via: best.via, sim: best.sim,
+        });
+      }
+    }
+    out.sort((a, b) => rank[a.kind] - rank[b.kind] || b.sim - a.sim || a.path.localeCompare(b.path));
+    return out.slice(0, limit).map(({ sim: _sim, ...m }) => m);
+  }
+
+  /**
+   * The words that best characterise a text against this index: tf-idf over the text,
+   * with words from its title counted three times, numbers and one-letter words
+   * dropped. Returns surface forms, best first, ready to join into a query.
+   */
+  distinctiveTerms(
+    text: string,
+    { title = "", limit = 12, self }: { title?: string; limit?: number; self?: string } = {},
+  ): string[] {
+    const N = this.docs.size || 1;
+    // The note the text comes from does not count towards a word's spread.
+    const selfId = self !== undefined ? this.byPath.get(self) : undefined;
+    const counts = new Map<string, { surface: string; tf: number }>();
+    const add = (tokens: string[], weight: number) => {
+      for (const t of tokens) {
+        if (t.length < 2 || /^\d+$/.test(t)) continue;
+        const k = accentKey(t);
+        const c = counts.get(k) ?? { surface: t, tf: 0 };
+        c.tf += weight;
+        counts.set(k, c);
+      }
+    };
+    add(tokenize(title), 3);
+    add(tokenize(text), 1);
+    const scored: Array<[string, number]> = [];
+    for (const [k, { surface, tf }] of counts) {
+      let df = 0;
+      for (const field of FIELDS) {
+        const p = this.postings.get(key(field, "a", k));
+        if (p) df = Math.max(df, p.size - (selfId !== undefined && p.has(selfId) ? 1 : 0));
+      }
+      // A word in no other note says nothing about which notes are related.
+      if (df === 0) continue;
+      // Words in more than a fifth of the vault are filler ("là", "the", "của").
+      if (df > Math.max(5, N / 5)) continue;
+      scored.push([surface, (1 + Math.log(tf)) * idf(N, df)]);
+    }
+    scored.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    return scored.slice(0, limit).map(([t]) => t);
   }
 
   private filter(options: SearchOptions): Set<number> | null {

@@ -184,3 +184,53 @@ test("findMatches offsets point into decomposed (NFD) text", () => {
   const [span] = findMatches(text, "trồng cây");
   expect(text.slice(span.start, span.end).normalize("NFC")).toBe("trồng cây");
 });
+
+describe("search modes, name lookup and distinctive terms", () => {
+  const idx = new SearchIndex();
+  const add = (path: string, body = "", extra: Partial<SearchDocument> = {}) =>
+    idx.upsert({ path, title: path.replace(/\.md$/, "").split("/").pop(), body, ...extra });
+  add("Software 2.0.md", "Karpathy: neural networks are software 2.0, written by optimisation.");
+  add("OAuth 2.0.md", "Authorization framework with access tokens.");
+  add("World models.md", "A world model predicts the next state of the world. Gaussian splatting renders scenes.");
+  add("Isaac Sim.md", "NVIDIA Isaac Sim uses OpenUSD scenes; SimReady assets plug into Isaac Lab.");
+  add("Thể chế hoá.md", "Đưa quy định thành thể chế.", { aliases: ["Institutionalisation"] });
+  add("Central server.md", "A central server coordinates clients.");
+
+  test("all keeps only notes with every word; phrase also needs them adjacent, in order", () => {
+    assert.deepEqual(
+      idx.search("software 2.0").hits.map((h) => h.path).slice(0, 2),
+      ["Software 2.0.md", "OAuth 2.0.md"],
+    );
+    assert.deepEqual(idx.search("software 2.0", { mode: "all" }).hits.map((h) => h.path), ["Software 2.0.md"]);
+    assert.deepEqual(idx.search("scenes world", { mode: "all" }).hits.map((h) => h.path), ["World models.md"]);
+    assert.equal(idx.search("scenes world", { mode: "phrase" }).total, 0);
+    assert.deepEqual(idx.search("gaussian splatting", { mode: "phrase" }).hits.map((h) => h.path), ["World models.md"]);
+  });
+
+  test("findByName tells exact, folded, contains and similar apart, and never matches body text", () => {
+    const kinds = (name: string) => idx.findByName(name).map((m) => [m.path, m.kind, m.via]);
+    assert.deepEqual(kinds("HY-World 2.0"), []);
+    assert.deepEqual(kinds("SimReady Central"), []);
+    assert.deepEqual(kinds("thể chế hóa"), [["Thể chế hoá.md", "exact", "title"]]);
+    assert.deepEqual(kinds("the che hoa"), [["Thể chế hoá.md", "folded", "title"]]);
+    assert.deepEqual(kinds("institutionalisation"), [["Thể chế hoá.md", "exact", "alias"]]);
+    assert.deepEqual(kinds("Isaac"), [["Isaac Sim.md", "contains", "title"]]);
+    assert.deepEqual(kinds("world model"), [["World models.md", "contains", "title"]]);
+    assert.deepEqual(kinds("world simulation models"), [["World models.md", "similar", "title"]]);
+  });
+
+  test("distinctiveTerms picks rare words, weights the title and drops filler", () => {
+    const terms = idx.distinctiveTerms("Tencent HY-World builds a world from text; export to Isaac Sim and OpenUSD.", {
+      title: "HY-World 2.0",
+    });
+    assert.ok(terms.includes("isaac"));
+    assert.ok(terms.includes("openusd"));
+    assert.ok(!terms.includes("tencent")); // in no note: says nothing about relatedness
+    assert.ok(!terms.includes("2")); // numbers dropped
+  });
+
+  test("exclude, coveragePower and noTitleBonus shape a related-notes query", () => {
+    const { hits } = idx.search("isaac openusd world", { exclude: ["Isaac Sim.md"], coveragePower: 0.5, noTitleBonus: true });
+    assert.deepEqual(hits.map((h) => h.path), ["World models.md"]);
+  });
+});

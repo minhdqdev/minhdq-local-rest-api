@@ -233,6 +233,17 @@ export interface SimpleSearchOptions {
   path?: string;
   /** Only notes carrying any of these tags; "ai" also matches "ai/rag". */
   tags?: string[];
+  /** any (default), all (every word), or phrase (words adjacent, in order). */
+  mode?: "any" | "all" | "phrase";
+}
+
+/** One hit of a compact search: enough to pick notes without reading match context. */
+export interface CompactSearchItem {
+  filename: string;
+  score: number;
+  description?: string;
+  /** Share of the query's words found in the note, 0–1. */
+  coverage: number;
 }
 
 export interface SimpleSearchResult {
